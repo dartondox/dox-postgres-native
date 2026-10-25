@@ -104,9 +104,17 @@ class PgNativePool {
   /// thread.
   ///
   /// [sslMode] is like libpq: `disable` (no TLS), `prefer` (TLS when the
-  /// server has it), `require` (TLS, no certificate check) or `verify-full`
-  /// (TLS, the certificate and the host name are checked with the Mozilla
-  /// roots and the roots of the system).
+  /// server has it), `require` (TLS, no certificate check), `verify-ca`
+  /// (TLS, the certificate chain is checked, not the host name) or
+  /// `verify-full` (TLS, the certificate and the host name are checked).
+  ///
+  /// [sslRootCert] is the path of a PEM file with the CA certificates to
+  /// trust, like libpq `sslrootcert`. Eg. the CA bundle of AWS RDS, or the
+  /// CA of a self-signed dev setup. With it, `verify-ca` and `verify-full`
+  /// trust only the certificates in that file. Without it, they use the
+  /// Mozilla roots and the roots of the system. `prefer` and `require` do
+  /// not use it. A file that is missing or has no valid certificate throws
+  /// [PgException].
   factory PgNativePool.open({
     String host = 'localhost',
     int port = 5432,
@@ -118,20 +126,22 @@ class PgNativePool {
     String? applicationName,
     int threads = 1,
     String sslMode = 'disable',
+    String? sslRootCert,
   }) {
-    // tokio-postgres knows disable, prefer and require. verify-full is
-    // require with the certificate check on.
+    // tokio-postgres knows disable, prefer and require. verify-ca and
+    // verify-full are require with the certificate check on.
     String? mode = const <String, String>{
       'disable': 'disable',
       'prefer': 'prefer',
       'require': 'require',
+      'verify-ca': 'require',
       'verify-full': 'require',
     }[sslMode];
     if (mode == null) {
       throw ArgumentError.value(
         sslMode,
         'sslMode',
-        'Must be disable, prefer, require or verify-full',
+        'Must be disable, prefer, require, verify-ca or verify-full',
       );
     }
     if (!isAvailable) {
@@ -154,13 +164,28 @@ class PgNativePool {
         'application_name=${_quote(applicationName)}',
     ].join(' ');
     Uint8List bytes = utf8.encode(config);
+    Uint8List rootCert = utf8.encode(sslRootCert ?? '');
+    Uint8List error = Uint8List(1024);
     int handle = dpgConnect(
       bytes.address,
       bytes.length,
       maxConnections,
       threads,
-      sslMode == 'verify-full' ? 1 : 0,
+      const <String, int>{'verify-full': 1, 'verify-ca': 2}[sslMode] ?? 0,
+      rootCert.address,
+      rootCert.length,
+      error.address,
+      error.length,
     );
+    if (handle == -2) {
+      int end = error.indexOf(0);
+      throw PgException(
+        utf8.decode(
+          error.sublist(0, end < 0 ? null : end),
+          allowMalformed: true,
+        ),
+      );
+    }
     if (handle <= 0) {
       throw ArgumentError('dox_postgres_native: bad connection config');
     }
@@ -169,8 +194,8 @@ class PgNativePool {
 
   /// Makes a pool from a url like
   /// `postgres://user:password@host:5432/database?sslmode=require`.
-  /// Reads `sslmode` and `application_name` from the query. A missing port
-  /// is 5432.
+  /// Reads `sslmode`, `sslrootcert` and `application_name` from the query.
+  /// A missing port is 5432.
   factory PgNativePool.fromUrl(
     String url, {
     int maxConnections = 10,
@@ -199,6 +224,7 @@ class PgNativePool {
       applicationName: q['application_name'],
       threads: threads,
       sslMode: q['sslmode'] ?? 'disable',
+      sslRootCert: q['sslrootcert'],
     );
   }
 

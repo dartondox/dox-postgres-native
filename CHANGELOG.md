@@ -1,3 +1,11 @@
+## 3.0.0-alpha.8
+
+- New `sslRootCert` option of `PgNativePool.open`: the path of a PEM file with the CA certificates to trust, like libpq `sslrootcert`. Use it for a private CA, eg. AWS RDS, Google Cloud SQL, Azure, or a self-signed dev setup. With it, only the certificates in that file are trusted. `fromUrl` reads `sslrootcert=` from the url.
+- New `sslMode` `verify-ca`: the certificate chain is checked, the host name is not. `verify-full` checks both. `prefer` and `require` still check nothing.
+- A missing, unreadable or empty `sslRootCert` file, or one with no valid certificate, throws a `PgException` at `open` that names the file.
+- The root cert path is part of the pool sharing key.
+- The native ABI version is now 4 (`dpg_connect` takes the check mode, the root cert path and an error buffer).
+
 ## 3.0.0-alpha.7
 
 - The package moved to its own repository: https://github.com/dartondox/dox-postgres-native. The ready-built libraries are on its releases (tag `v<version>`).

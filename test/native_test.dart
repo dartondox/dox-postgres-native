@@ -305,7 +305,7 @@ void main() {
       expect((await prefer.query('SELECT 1 AS n')).rows.single['n'], 1);
       prefer.close();
       expect(
-        () => PgNativePool.open(user: 'u', database: 'd', sslMode: 'verify-ca'),
+        () => PgNativePool.open(user: 'u', database: 'd', sslMode: 'bogus'),
         throwsArgumentError,
       );
     });
