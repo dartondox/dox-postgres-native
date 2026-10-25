@@ -28,15 +28,15 @@ const String _releases =
 /// `dart run tool/native_hashes.dart v<version>`
 const Map<String, String> _sha256 = <String, String>{
   'dox_postgres_native-linux-arm64.so':
-      'dcf297fc1168c4c085078710e6d99bd025a75202b2a33098c70316c6392d3d37',
+      '8631091e4911cc9db5998edbab0257b394a7d1633727e9c769f8ef900be31b9a',
   'dox_postgres_native-linux-x64.so':
-      '1d42e47e1cd372a7a41b8f9dac514819ec49e15466c52881bdd762b5c80f227b',
+      'be1ee0111c804e17ac1cff2d3fa883e05dfe7e6c8cb937a241aedc08572f126f',
   'dox_postgres_native-macos-arm64.dylib':
-      'a659662c4bcf82b09098a83a4d6a4dc89fdd29058349e7b739a484dabe6fa485',
+      '0685be0afdb23c5a6c63a2a5750a19738cc31b18e0ac37d76ab425e5cfd7370b',
   'dox_postgres_native-macos-x64.dylib':
-      'b255087ea02462f18fd47d1bcf3ec153d9eb71a7c7365ba0dd1ffc4d0396ef10',
+      '903e9e1d48ab3504683dff5ed67a1b903dc190b21fe4de4ed53c7913513e5f46',
   'dox_postgres_native-windows-x64.dll':
-      '311534a6c7484450d18f6f64c9c6c9deda55991f447e7c09216140f4464951f6',
+      'a977dfd5cf6f919f84fa2ba76a0e3e87c3d33a4af4b535dfe87150664fa9613e',
 };
 
 void main(List<String> args) async {

@@ -121,8 +121,13 @@ jobs:
           # a version with "-" (like 3.0.0-alpha.7) is a prerelease
           pre=()
           case "$TAG" in *-*) pre=(--prerelease) ;; esac
-          gh release create "$TAG" ./* --repo "$GITHUB_REPOSITORY" ${pre[@]+"${pre[@]}"} \
-            --title "$TAG" --notes "Ready-built $LIB libraries. See SHA256SUMS."
+          # a re-run replaces the files of the release
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" ./* --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$TAG" ./* --repo "$GITHUB_REPOSITORY" ${pre[@]+"${pre[@]}"} \
+              --title "$TAG" --notes "Ready-built $LIB libraries. See SHA256SUMS."
+          fi
 
   publish:
     needs: release
