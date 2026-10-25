@@ -20,7 +20,8 @@ import 'package:code_assets/code_assets.dart';
 import 'package:crypto/crypto.dart';
 import 'package:hooks/hooks.dart';
 
-const String _releases = 'https://github.com/dartondox/dox-postgres-native/releases/download';
+const String _releases =
+    'https://github.com/dartondox/dox-postgres-native/releases/download';
 
 /// sha256 of each release asset. The release workflow
 /// (.github/workflows/ci.yaml) fills it from `SHA256SUMS` of the release:

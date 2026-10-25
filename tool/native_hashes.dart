@@ -21,9 +21,8 @@ Future<void> main(List<String> args) async {
     exit(66);
   }
   String source = hook.readAsStringSync();
-  String releases = RegExp(
-    r"const String _releases = '([^']+)';",
-  ).firstMatch(source)![1]!;
+  String releases = RegExp(r"const String _releases = '([^']+)';")
+      .firstMatch(source)![1]!;
   String package = RegExp(
     r'^name:\s*(\S+)',
     multiLine: true,
