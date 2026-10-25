@@ -98,7 +98,28 @@ try {
 - `disable` (the default): no TLS.
 - `prefer`: TLS when the server has it, no certificate check.
 - `require`: TLS, no certificate check.
-- `verify-full`: TLS, and the certificate and host name are checked. It uses the Mozilla roots and the roots of the system.
+- `verify-ca`: TLS, and the certificate chain is checked. The host name is not checked.
+- `verify-full`: TLS, and the certificate and the host name are checked.
+
+`verify-ca` and `verify-full` use the Mozilla roots and the roots of the system.
+Your database may use a private CA, eg. AWS RDS, Google Cloud SQL, Azure, or a self-signed dev setup.
+Then give the CA file with `sslRootCert` (or `sslrootcert` in the url):
+
+```dart
+PgNativePool pool = PgNativePool.open(
+  host: 'mydb.abc123.eu-west-1.rds.amazonaws.com',
+  user: 'app',
+  password: 'secret',
+  database: 'app',
+  sslMode: 'verify-full',
+  sslRootCert: '/etc/ssl/rds-global-bundle.pem',
+);
+```
+
+- It is the path of a PEM file with one or more CA certificates.
+- With it, only the certificates in that file are trusted, like libpq.
+- A file that is missing, or has no valid certificate, throws a `PgException` that names the file.
+- `prefer` and `require` do not use it.
 
 ## Features
 

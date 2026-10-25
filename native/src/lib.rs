@@ -25,8 +25,8 @@
 //! - status 3 (transaction started): u64 transaction id.
 //!
 //! TLS is rustls. `sslmode` in the config turns it on (`prefer` or
-//! `require`); `dpg_connect` says if the certificate and host name are
-//! checked.
+//! `require`); `dpg_connect` says how the certificate is checked, and which
+//! CA file to trust.
 use std::collections::HashMap;
 use std::ffi::{CStr, c_char, c_int, c_void};
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -49,7 +49,7 @@ use tokio_postgres::{Row, Statement};
 use tokio_postgres_rustls::MakeRustlsConnect;
 
 /// Bump when the FFI functions or the record layout change.
-const ABI_VERSION: i32 = 3;
+const ABI_VERSION: i32 = 4;
 const REQ_HEAD: usize = 32;
 const RES_HEAD: usize = 13;
 /// Statements kept per connection. Over this, the one used longest ago is
@@ -864,47 +864,99 @@ fn run_plain(reqs: Vec<Request>, sink: Arc<Sink>, rt: &Handle) {
 
 // ---- TLS ---------------------------------------------------------------
 
-/// The TLS connector of a pool. Only used when `sslmode` is `prefer` or
-/// `require`. `verify` checks the certificate chain (the Mozilla roots and
-/// the roots of the system) and the host name.
-fn tls(verify: bool) -> MakeRustlsConnect {
+/// How a pool checks the server certificate, like libpq `sslmode`. Only
+/// used when TLS is on (`prefer` or `require` in the config).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Check {
+    /// `require`, `prefer`: no check
+    None,
+    /// `verify-full`: the chain and the host name
+    Full,
+    /// `verify-ca`: the chain, not the host name
+    Chain,
+}
+
+/// The CA certificates to trust. With `root_cert` (a PEM file path), only
+/// the certificates in that file, like libpq `sslrootcert`. Without it,
+/// the Mozilla roots and the roots of the system.
+fn roots(root_cert: &str) -> Result<rustls::RootCertStore, String> {
+    use rustls::pki_types::CertificateDer;
+    use rustls::pki_types::pem::{self, PemObject};
+    let mut roots = rustls::RootCertStore::empty();
+    if root_cert.is_empty() {
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        // ponytail: a system root that fails to parse is skipped
+        for cert in rustls_native_certs::load_native_certs().certs {
+            let _ = roots.add(cert);
+        }
+        return Ok(roots);
+    }
+    let bad = |e: pem::Error| match e {
+        pem::Error::Io(e) => format!("can not read sslRootCert {root_cert}: {e}"),
+        e => format!("sslRootCert {root_cert} is not a valid PEM file: {e}"),
+    };
+    for cert in CertificateDer::pem_file_iter(root_cert).map_err(bad)? {
+        roots
+            .add(cert.map_err(bad)?)
+            .map_err(|e| format!("sslRootCert {root_cert} has a bad certificate: {e}"))?;
+    }
+    if roots.is_empty() {
+        return Err(format!("sslRootCert {root_cert} has no certificate"));
+    }
+    Ok(roots)
+}
+
+/// The TLS connector of a pool.
+fn tls(check: Check, root_cert: &str) -> Result<MakeRustlsConnect, String> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let builder = rustls::ClientConfig::builder_with_provider(provider.clone())
         .with_safe_default_protocol_versions()
         .expect("TLS versions");
-    let config = if verify {
-        let mut roots = rustls::RootCertStore {
-            roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
-        };
-        // ponytail: a system root that fails to parse is skipped. Add a
-        // `sslrootcert` option when an app needs its own CA file.
-        for cert in rustls_native_certs::load_native_certs().certs {
-            let _ = roots.add(cert);
+    let config = match check {
+        Check::Full => builder
+            .with_root_certificates(roots(root_cert)?)
+            .with_no_client_auth(),
+        _ => {
+            let roots = match check {
+                Check::Chain => Some(Arc::new(roots(root_cert)?)),
+                _ => None,
+            };
+            builder
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(Verifier { provider, roots }))
+                .with_no_client_auth()
         }
-        builder.with_root_certificates(roots).with_no_client_auth()
-    } else {
-        builder
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(NoVerify(provider)))
-            .with_no_client_auth()
     };
-    MakeRustlsConnect::new(config)
+    Ok(MakeRustlsConnect::new(config))
 }
 
-/// `sslmode=require`: any certificate is fine, like libpq. The handshake
-/// signatures are still checked.
+/// `require` (no `roots`): any certificate is fine, like libpq.
+/// `verify-ca` (`roots`): the chain must end at one of `roots`, the host
+/// name is not checked. The handshake signatures are always checked.
 #[derive(Debug)]
-struct NoVerify(Arc<rustls::crypto::CryptoProvider>);
+struct Verifier {
+    provider: Arc<rustls::crypto::CryptoProvider>,
+    roots: Option<Arc<rustls::RootCertStore>>,
+}
 
-impl rustls::client::danger::ServerCertVerifier for NoVerify {
+impl rustls::client::danger::ServerCertVerifier for Verifier {
     fn verify_server_cert(
         &self,
-        _: &rustls::pki_types::CertificateDer<'_>,
-        _: &[rustls::pki_types::CertificateDer<'_>],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        intermediates: &[rustls::pki_types::CertificateDer<'_>],
         _: &rustls::pki_types::ServerName<'_>,
         _: &[u8],
-        _: rustls::pki_types::UnixTime,
+        now: rustls::pki_types::UnixTime,
     ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        if let Some(roots) = &self.roots {
+            rustls::client::verify_server_cert_signed_by_trust_anchor(
+                &rustls::server::ParsedCertificate::try_from(cert)?,
+                roots,
+                intermediates,
+                now,
+                self.provider.signature_verification_algorithms.all,
+            )?;
+        }
         Ok(rustls::client::danger::ServerCertVerified::assertion())
     }
 
@@ -918,7 +970,7 @@ impl rustls::client::danger::ServerCertVerifier for NoVerify {
             message,
             cert,
             dss,
-            &self.0.signature_verification_algorithms,
+            &self.provider.signature_verification_algorithms,
         )
     }
 
@@ -932,12 +984,14 @@ impl rustls::client::danger::ServerCertVerifier for NoVerify {
             message,
             cert,
             dss,
-            &self.0.signature_verification_algorithms,
+            &self.provider.signature_verification_algorithms,
         )
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        self.0.signature_verification_algorithms.supported_schemes()
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
     }
 }
 
@@ -979,44 +1033,72 @@ pub unsafe extern "C" fn dpg_init(data: *mut c_void) -> i32 {
 
 /// Makes a pool from a libpq style config (`host=... user=...` or a
 /// `postgres://` url). Connections open when they are needed. The same
-/// config, `max_size` and `verify` give the same pool, so isolates share
-/// it: up to `max_size` connections for the whole process. Each open needs
-/// one [dpg_close]. Returns a pool handle (> 0), or -1 when the config is
-/// bad.
+/// config, `max_size`, `verify` and `root_cert` give the same pool, so
+/// isolates share it: up to `max_size` connections for the whole process.
+/// Each open needs one [dpg_close]. Returns a pool handle (> 0), -1 when
+/// the config is bad, or -2 when the CA file can not be used. For -2 the
+/// reason is in `err` (UTF-8, cut at `err_cap` bytes, the rest untouched).
 ///
-/// `verify` 1 checks the server certificate and its host name when TLS is
-/// on (`verify-full`). 0 encrypts without a check (`require`, `prefer`).
+/// `verify` checks the server certificate when TLS is on: 0 no check
+/// (`require`, `prefer`), 1 the chain and the host name (`verify-full`),
+/// 2 the chain only (`verify-ca`). `root_cert` is the path of a PEM file
+/// with the CA certificates to trust (`sslrootcert`), or empty for the
+/// Mozilla and system roots.
 ///
 /// # Safety
-/// `cfg` must point to `len` readable bytes.
+/// `cfg` must point to `len` readable bytes, `root_cert` to `root_len`
+/// readable bytes (or `root_len` is 0), `err` to `err_cap` writable bytes.
 #[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn dpg_connect(
     cfg: *const u8,
     len: i64,
     max_size: i64,
     threads: i64,
     verify: i64,
+    root_cert: *const u8,
+    root_len: i64,
+    err: *mut u8,
+    err_cap: i64,
 ) -> i64 {
     let cfg = unsafe { std::slice::from_raw_parts(cfg, len as usize) };
-    let Ok(cfg) = std::str::from_utf8(cfg) else {
+    let root_cert = if root_len > 0 {
+        unsafe { std::slice::from_raw_parts(root_cert, root_len as usize) }
+    } else {
+        &[]
+    };
+    let (Ok(cfg), Ok(root_cert)) = (std::str::from_utf8(cfg), std::str::from_utf8(root_cert))
+    else {
         return -1;
     };
     let Ok(pg) = tokio_postgres::Config::from_str(cfg) else {
         return -1;
     };
     let max_size = max_size.max(1) as usize;
-    let verify = verify != 0;
+    let check = match verify {
+        1 => Check::Full,
+        2 => Check::Chain,
+        _ => Check::None,
+    };
     // sslmode is in `cfg`, so the key has all the TLS settings
-    let key = format!("{max_size} {verify} {cfg}");
+    let key = format!("{max_size} {check:?} {root_cert:?} {cfg}");
     runtime(threads.max(0) as usize);
     with(&POOLS, |r| {
         if let Some((handle, shared)) = r.map.iter().find(|(_, s)| s.key == key) {
             shared.refs.fetch_add(1, Ordering::Relaxed);
             return *handle as i64;
         }
+        let tls = match tls(check, root_cert) {
+            Ok(t) => t,
+            Err(text) => {
+                let n = text.len().min(err_cap.max(0) as usize);
+                unsafe { std::ptr::copy_nonoverlapping(text.as_ptr(), err, n) };
+                return -2;
+            }
+        };
         let manager = Manager::from_config(
             pg,
-            tls(verify),
+            tls,
             ManagerConfig {
                 recycling_method: RecyclingMethod::Fast,
             },
@@ -1172,15 +1254,28 @@ mod tests {
     #[test]
     fn same_config_shares_one_pool_until_the_last_close() {
         let cfg = b"host=127.0.0.1 port=1 user=u dbname=close_test";
-        let open =
-            |max, verify| unsafe { dpg_connect(cfg.as_ptr(), cfg.len() as i64, max, 0, verify) };
+        let open = |max, verify| unsafe {
+            dpg_connect(
+                cfg.as_ptr(),
+                cfg.len() as i64,
+                max,
+                0,
+                verify,
+                std::ptr::null(),
+                0,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
         let (a, b, other) = (open(3, 0), open(3, 0), open(4, 0));
         assert_eq!(a, b);
         assert_ne!(a, other);
         // other TLS settings are another pool
-        let checked = open(3, 1);
+        let (checked, chain) = (open(3, 1), open(3, 2));
         assert_ne!(a, checked);
+        assert_ne!(checked, chain);
         dpg_close(checked);
+        dpg_close(chain);
         let alive = |h: i64| with(&POOLS, |r| r.map.contains_key(&(h as u64)));
         dpg_close(a);
         assert!(alive(a));
@@ -1190,6 +1285,72 @@ mod tests {
         dpg_close(other);
         // one more close does nothing
         dpg_close(a);
+    }
+
+    const CA: &str = "-----BEGIN CERTIFICATE-----
+MIIBbjCCAROgAwIBAgIUapxcBXf/W5J6jq+bvIvAcm7WjZEwCgYIKoZIzj0EAwIw
+DDEKMAgGA1UEAwwBdDAeFw0yNjEwMjUwNDE2NTBaFw0yNjEwMjYwNDE2NTBaMAwx
+CjAIBgNVBAMMAXQwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAR3126Iq8l00WNh
+puPevZclvBR5QCaVwROgDCnA0EOFIhK/2GZklmsSeKGau7VsoFjztFNKmCGskYNa
+Ze/kfYogo1MwUTAdBgNVHQ4EFgQUkocrqtYW7FOgQXVrJP57RRe+6KUwHwYDVR0j
+BBgwFoAUkocrqtYW7FOgQXVrJP57RRe+6KUwDwYDVR0TAQH/BAUwAwEB/zAKBggq
+hkjOPQQDAgNJADBGAiEAqQU+Zx4LzqU6qcXoeWDifNIOS/U34hwvw8dUaeKvGDwC
+IQChrAxPCa3pOVQrngZWVrIwXdxzIjmLn0PAqqeF9RpYFg==
+-----END CERTIFICATE-----
+";
+
+    #[test]
+    fn loads_the_root_cert_file() {
+        let dir = std::env::temp_dir().join(format!("dpg_roots_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = |name: &str, text: &str| {
+            let path = dir.join(name);
+            std::fs::write(&path, text).unwrap();
+            path.to_str().unwrap().to_string()
+        };
+        // one or more certificates, other sections are skipped
+        let good = file("good.pem", &format!("{CA}{CA}"));
+        assert_eq!(roots(&good).unwrap().len(), 2);
+        let err = |path: &str| roots(path).unwrap_err();
+        let missing = dir.join("missing.pem");
+        let missing = missing.to_str().unwrap();
+        assert!(err(missing).starts_with(&format!("can not read sslRootCert {missing}: ")));
+        let empty = file("empty.pem", "no pem here\n");
+        assert_eq!(
+            err(&empty),
+            format!("sslRootCert {empty} has no certificate")
+        );
+        let broken = file(
+            "broken.pem",
+            "-----BEGIN CERTIFICATE-----\n!!!\n-----END CERTIFICATE-----\n",
+        );
+        assert!(err(&broken).starts_with(&format!("sslRootCert {broken} is not a valid PEM file")));
+        let not_der = file(
+            "not_der.pem",
+            "-----BEGIN CERTIFICATE-----\naGVsbG8=\n-----END CERTIFICATE-----\n",
+        );
+        assert!(err(&not_der).starts_with(&format!("sslRootCert {not_der} has a bad certificate")));
+        // no file: the Mozilla roots, and the system roots
+        assert!(roots("").unwrap().len() > 100);
+        // dpg_connect gives -2 and the reason, for a check that uses it
+        let cfg = b"host=127.0.0.1 port=1 user=u dbname=roots_test";
+        let mut buf = [0u8; 256];
+        let h = unsafe {
+            dpg_connect(
+                cfg.as_ptr(),
+                cfg.len() as i64,
+                1,
+                0,
+                1,
+                empty.as_ptr(),
+                empty.len() as i64,
+                buf.as_mut_ptr(),
+                buf.len() as i64,
+            )
+        };
+        assert_eq!(h, -2);
+        assert!(String::from_utf8_lossy(&buf).contains("has no certificate"));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// A host that starts with `/` is a Unix socket folder, like Google
