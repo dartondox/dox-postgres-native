@@ -124,6 +124,8 @@ jobs:
           # a re-run replaces the files of the release
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release upload "$TAG" ./* --clobber --repo "$GITHUB_REPOSITORY"
+            # a deleted and pushed again tag leaves the release as a draft
+            gh release edit "$TAG" --draft=false --repo "$GITHUB_REPOSITORY"
           else
             gh release create "$TAG" ./* --repo "$GITHUB_REPOSITORY" ${pre[@]+"${pre[@]}"} \
               --title "$TAG" --notes "Ready-built $LIB libraries. See SHA256SUMS."
