@@ -3,10 +3,10 @@
 Native Postgres client for Dart. It is the default Postgres driver of the Dox ORM.
 
 [![pub package](https://img.shields.io/pub/v/dox_postgres_native.svg)](https://pub.dev/packages/dox_postgres_native)
-[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/dartondox/dox/blob/develop/LICENSE)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/dartondox/dox-postgres-native/blob/main/LICENSE)
 
 Part of [Dox](https://dartondox.dev), a web backend framework for Dart, like Laravel.
-Source code: [github.com/dartondox/dox](https://github.com/dartondox/dox).
+Source code: [github.com/dartondox/dox-postgres-native](https://github.com/dartondox/dox-postgres-native).
 
 ## Install
 
@@ -81,4 +81,4 @@ void main() async {
 
 ## License
 
-MIT. See [LICENSE](https://github.com/dartondox/dox/blob/develop/LICENSE).
+MIT. See [LICENSE](https://github.com/dartondox/dox-postgres-native/blob/main/LICENSE).

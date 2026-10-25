@@ -20,13 +20,11 @@ import 'package:code_assets/code_assets.dart';
 import 'package:crypto/crypto.dart';
 import 'package:hooks/hooks.dart';
 
-const String _releases = 'https://github.com/dartondox/dox/releases/download';
+const String _releases = 'https://github.com/dartondox/dox-postgres-native/releases/download';
 
 /// sha256 of each release asset. The release workflow
-/// (.github/workflows/native.yaml) builds the libraries on a
-/// `dox_postgres_native-v*` tag and uploads them with `SHA256SUMS`. Then fill
-/// this map before publishing to pub.dev:
-/// `dart run bin/native_hashes.dart dox_postgres_native-v<version>`
+/// (.github/workflows/ci.yaml) fills it from `SHA256SUMS` of the release:
+/// `dart run tool/native_hashes.dart v<version>`
 const Map<String, String> _sha256 = <String, String>{
   'dox_postgres_native-linux-arm64.so':
       'dcf297fc1168c4c085078710e6d99bd025a75202b2a33098c70316c6392d3d37',
@@ -122,7 +120,7 @@ Future<Uri?> _download(
     ..connectionTimeout = const Duration(seconds: 30);
   try {
     HttpClientRequest req = await client.getUrl(
-      Uri.parse('$_releases/dox_postgres_native-v$version/$asset'),
+      Uri.parse('$_releases/v$version/$asset'),
     );
     HttpClientResponse res = await req.close();
     if (res.statusCode != 200) {

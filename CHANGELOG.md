@@ -1,4 +1,6 @@
-## Unreleased
+## 3.0.0-alpha.7
+
+- The package moved to its own repository: https://github.com/dartondox/dox-postgres-native. The ready-built libraries are on its releases (tag `v<version>`).
 
 - Breaking: isolates that open the same settings (and the same `maxConnections`) now share one pool in Rust, like `dox_mysql_native`. So `maxConnections` is for the whole process, not per isolate. Before, 8 isolates with the default of 10 could open 80 connections. Each `open` counts, and only the last `close()` closes the pool. The native ABI version is now 2.
 - The prepared statement cache of a connection drops the statement used longest ago when it is full (LRU, 512 statements). Before, it dropped all statements at once.

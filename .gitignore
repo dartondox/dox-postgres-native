@@ -1,0 +1,5 @@
+.dart_tool/
+.DS_Store
+pubspec.lock
+native/target/
+dist/

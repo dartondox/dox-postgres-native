@@ -1,0 +1,157 @@
+name: CI
+
+# Every push to main and every pull request: Rust checks, then the Dart
+# tests.
+#
+# A tag like v3.0.0-alpha.7 (it must match the version in pubspec.yaml):
+# 1. build the library for the 5 targets,
+# 2. upload them to the GitHub release of the tag, with SHA256SUMS,
+# 3. fill `_sha256` in hook/build.dart from SHA256SUMS, publish the package
+#    to pub.dev, and push the new hashes to main.
+# The hook downloads these files, so users do not need Rust.
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+    paths-ignore: ['**.md']
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  LIB: dox_postgres_native
+
+jobs:
+  test:
+    if: github.ref_type != 'tag'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Postgres boots while the next steps run
+      - name: Start Postgres 16
+        run: |
+          docker run -d --name postgres -p 5432:5432 \
+            -e POSTGRES_DB=postgres -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=postgres \
+            --health-cmd pg_isready --health-interval 2s postgres:16
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: native
+      - uses: dart-lang/setup-dart@v1
+        with:
+          sdk: stable
+      # the build is kept: the Dart build hook uses native/target/release
+      - name: Rust checks
+        working-directory: native
+        env:
+          PG_URL: postgres://postgres:postgres@localhost:5432/postgres
+        run: |
+          cargo fmt --check
+          cargo clippy --release --all-targets -- -D warnings
+          cargo test --release
+          cargo build --release
+      - name: Dart checks
+        run: |
+          dart pub get
+          dart format --output=none --set-exit-if-changed .
+          dart analyze --fatal-infos .
+      - name: Wait for Postgres
+        run: timeout 90 sh -c 'until [ "$(docker inspect -f "{{.State.Health.Status}}" postgres)" = healthy ]; do sleep 1; done'
+      - name: Dart tests
+        run: |
+          DRIVER=postgres DB_PORT=5432 dart test --concurrency=1
+
+  build:
+    if: startsWith(github.ref, 'refs/tags/v')
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-latest, target: aarch64-apple-darwin, file: libdox_postgres_native.dylib, asset: dox_postgres_native-macos-arm64.dylib }
+          - { os: macos-latest, target: x86_64-apple-darwin, file: libdox_postgres_native.dylib, asset: dox_postgres_native-macos-x64.dylib }
+          # 22.04: an older glibc, so the library loads on more Linux systems
+          - { os: ubuntu-22.04, target: x86_64-unknown-linux-gnu, file: libdox_postgres_native.so, asset: dox_postgres_native-linux-x64.so }
+          - { os: ubuntu-22.04-arm, target: aarch64-unknown-linux-gnu, file: libdox_postgres_native.so, asset: dox_postgres_native-linux-arm64.so }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc, file: dox_postgres_native.dll, asset: dox_postgres_native-windows-x64.dll }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check that the tag matches pubspec.yaml
+        shell: bash
+        run: |
+          v=$(sed -nE 's/^version:[[:space:]]*([^[:space:]]+).*/\1/p' pubspec.yaml)
+          [ "v$v" = "$GITHUB_REF_NAME" ] || { echo "::error::tag $GITHUB_REF_NAME, pubspec $v"; exit 1; }
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Build
+        shell: bash
+        working-directory: native
+        run: |
+          cargo build --release --target ${{ matrix.target }}
+          mkdir -p ../dist
+          cp target/${{ matrix.target }}/release/${{ matrix.file }} ../dist/${{ matrix.asset }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Upload to the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        working-directory: dist
+        run: |
+          sha256sum "$LIB"-* > SHA256SUMS
+          cat SHA256SUMS
+          # a version with "-" (like 3.0.0-alpha.7) is a prerelease
+          pre=()
+          case "$TAG" in *-*) pre=(--prerelease) ;; esac
+          gh release create "$TAG" ./* --repo "$GITHUB_REPOSITORY" ${pre[@]+"${pre[@]}"} \
+            --title "$TAG" --notes "Ready-built $LIB libraries. See SHA256SUMS."
+
+  publish:
+    needs: release
+    runs-on: ubuntu-latest
+    environment: pub.dev
+    permissions:
+      id-token: write # pub.dev automated publishing (OIDC)
+      contents: write # push the hashes to main
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      # the tag must be on main, so the published code is what main has
+      - name: Check that the tag is on main
+        run: git merge-base --is-ancestor "$GITHUB_SHA" HEAD && git checkout "$GITHUB_SHA"
+      - uses: dart-lang/setup-dart@v1
+        with:
+          sdk: stable
+      - name: Fill the hashes
+        run: dart run tool/native_hashes.dart "$GITHUB_REF_NAME"
+      - name: Publish to pub.dev
+        run: dart pub publish --force
+      - name: Push the hashes to main
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git stash
+          git checkout main
+          git stash pop
+          git commit -am "Hashes of the $GITHUB_REF_NAME libraries"
+          git push origin main
