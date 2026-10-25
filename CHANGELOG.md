@@ -8,6 +8,14 @@
 - Faster decode of `uuid`, `numeric`, `date`, `json` and `jsonb`, without the type registry of the `postgres` package. A negative `numeric` below 1 now has its leading zero: `-0.5`, not `-.5` like the `postgres` package.
 - An `int` parameter is written as text straight into the request buffer, without a `String`. It still goes without a type, so the server picks it.
 - The column names are kept per SQL text, not only for the last result. Queries that take turns no longer decode their column names again.
+- Breaking: no more `postgres` package. This package now has its own `@name` parser, value encoder and errors. Dox has no Dart driver to fall back to.
+- Breaking: errors are `PgException` (with `message`) and `PgServerException` (with `code`, `severity`, `detail`, `hint`, `schema`, `table`, `column`, `constraint`). The `ServerException` classes of the `postgres` package are gone.
+- Breaking: parameter values are `null`, `bool`, `int`, `double`, `String`, `DateTime`, `Duration`, `Uint8List` (bytea), `Map` (json) and `List` (array). Another type throws `ArgumentError`. `TypedValue` is gone: use a cast in the SQL (`@id::int8` or `@id:int8`).
+- Breaking: some result types changed. `interval` is a `Duration` (a month is 30 days), `time` is a `String` like `13:45:01.5`, an infinite date or timestamp is `'infinity'` or `'-infinity'`, and a type it does not know is its binary bytes (`Uint8List`).
+- TLS with rustls. New `sslMode` option: `disable` (default), `prefer`, `require` or `verify-full`. `verify-full` checks the certificate and host name with the Mozilla roots and the roots of the system. The TLS settings are part of the pool sharing key.
+- New `PgNativePool.fromUrl('postgres://user:pass@host:5432/db?sslmode=require')`.
+- An error without a server code now tells its cause, eg. `error performing TLS handshake: invalid peer certificate: UnknownIssuer`.
+- The native ABI version is now 3 (`dpg_connect` takes the certificate check flag).
 
 ## 3.0.0-alpha.6
 

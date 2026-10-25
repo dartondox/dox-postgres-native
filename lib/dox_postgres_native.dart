@@ -2,4 +2,5 @@
 /// Postgres driver.
 library;
 
+export 'src/exceptions.dart';
 export 'src/pool.dart';

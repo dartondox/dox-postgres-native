@@ -63,7 +63,7 @@ void main(List<String> args) async {
     if (lib == null) {
       stderr.writeln(
         'dox_postgres_native: no native library for ${os.name}-${arch.name}. '
-        'Install Rust (rustup) or use the Dart postgres driver.',
+        'Install Rust (rustup) to build it.',
       );
       return;
     }
