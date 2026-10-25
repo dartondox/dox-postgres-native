@@ -4,7 +4,7 @@ import 'dart:ffi';
 /// the library as the code asset of this file.
 
 /// The ABI version the Dart side expects. Must match `ABI_VERSION` in Rust.
-const int abiVersion = 2;
+const int abiVersion = 3;
 
 @Native<Int32 Function()>(symbol: 'dpg_version', isLeaf: true)
 external int dpgVersion();
@@ -12,7 +12,7 @@ external int dpgVersion();
 @Native<Int32 Function(Pointer<Void>)>(symbol: 'dpg_init')
 external int dpgInit(Pointer<Void> dlData);
 
-@Native<Int64 Function(Pointer<Uint8>, Int64, Int64, Int64)>(
+@Native<Int64 Function(Pointer<Uint8>, Int64, Int64, Int64, Int64)>(
   symbol: 'dpg_connect',
   isLeaf: true,
 )
@@ -21,6 +21,7 @@ external int dpgConnect(
   int length,
   int maxSize,
   int threads,
+  int verify,
 );
 
 @Native<Void Function(Int64)>(symbol: 'dpg_close')

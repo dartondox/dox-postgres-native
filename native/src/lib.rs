@@ -8,8 +8,7 @@
 //! One pool per config and size, for the whole process: isolates that open
 //! the same settings share it. Each open needs one `dpg_close`.
 //!
-//! Values stay in the Postgres binary format. Dart decodes them, the same
-//! way the `postgres` Dart package does.
+//! Result values stay in the Postgres binary format. Dart decodes them.
 //!
 //! Request record (little endian, 32 byte head): u64 id, u64 pool,
 //! u64 tx (0: no transaction), u8 kind (0 query, 1 begin, 2 commit,
@@ -24,6 +23,10 @@
 //!   Postgres error field code, eg. b'C'), u32 length, text.
 //! - status 2 (other error): the message.
 //! - status 3 (transaction started): u64 transaction id.
+//!
+//! TLS is rustls. `sslmode` in the config turns it on (`prefer` or
+//! `require`); `dpg_connect` says if the certificate and host name are
+//! checked.
 use std::collections::HashMap;
 use std::ffi::{CStr, c_char, c_int, c_void};
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -42,10 +45,11 @@ use tokio::sync::mpsc;
 use tokio_postgres::error::{ErrorPosition, SqlState};
 use tokio_postgres::types::Format;
 use tokio_postgres::types::{FromSql, IsNull, Kind, ToSql, Type, to_sql_checked};
-use tokio_postgres::{NoTls, Row, Statement};
+use tokio_postgres::{Row, Statement};
+use tokio_postgres_rustls::MakeRustlsConnect;
 
 /// Bump when the FFI functions or the record layout change.
-const ABI_VERSION: i32 = 2;
+const ABI_VERSION: i32 = 3;
 const REQ_HEAD: usize = 32;
 const RES_HEAD: usize = 13;
 /// Statements kept per connection. Over this, the one used longest ago is
@@ -366,7 +370,15 @@ fn message(out: &mut Vec<u8>, id: u64, text: &str) {
 
 fn error(out: &mut Vec<u8>, id: u64, e: &tokio_postgres::Error) {
     let Some(db) = e.as_db_error() else {
-        return message(out, id, &e.to_string());
+        // with the causes, eg. why the TLS handshake failed
+        let mut text = e.to_string();
+        let mut cause = std::error::Error::source(e);
+        while let Some(c) = cause {
+            text.push_str(": ");
+            text.push_str(&c.to_string());
+            cause = c.source();
+        }
+        return message(out, id, &text);
     };
     let at = head(out, id, 1);
     let line = db.line().map(|l| l.to_string());
@@ -850,6 +862,85 @@ fn run_plain(reqs: Vec<Request>, sink: Arc<Sink>, rt: &Handle) {
     });
 }
 
+// ---- TLS ---------------------------------------------------------------
+
+/// The TLS connector of a pool. Only used when `sslmode` is `prefer` or
+/// `require`. `verify` checks the certificate chain (the Mozilla roots and
+/// the roots of the system) and the host name.
+fn tls(verify: bool) -> MakeRustlsConnect {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let builder = rustls::ClientConfig::builder_with_provider(provider.clone())
+        .with_safe_default_protocol_versions()
+        .expect("TLS versions");
+    let config = if verify {
+        let mut roots = rustls::RootCertStore {
+            roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+        };
+        // ponytail: a system root that fails to parse is skipped. Add a
+        // `sslrootcert` option when an app needs its own CA file.
+        for cert in rustls_native_certs::load_native_certs().certs {
+            let _ = roots.add(cert);
+        }
+        builder.with_root_certificates(roots).with_no_client_auth()
+    } else {
+        builder
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoVerify(provider)))
+            .with_no_client_auth()
+    };
+    MakeRustlsConnect::new(config)
+}
+
+/// `sslmode=require`: any certificate is fine, like libpq. The handshake
+/// signatures are still checked.
+#[derive(Debug)]
+struct NoVerify(Arc<rustls::crypto::CryptoProvider>);
+
+impl rustls::client::danger::ServerCertVerifier for NoVerify {
+    fn verify_server_cert(
+        &self,
+        _: &rustls::pki_types::CertificateDer<'_>,
+        _: &[rustls::pki_types::CertificateDer<'_>],
+        _: &rustls::pki_types::ServerName<'_>,
+        _: &[u8],
+        _: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.0.signature_verification_algorithms.supported_schemes()
+    }
+}
+
 // ---- FFI ---------------------------------------------------------------
 
 /// ABI version of this library. Dart checks it at load.
@@ -888,14 +979,24 @@ pub unsafe extern "C" fn dpg_init(data: *mut c_void) -> i32 {
 
 /// Makes a pool from a libpq style config (`host=... user=...` or a
 /// `postgres://` url). Connections open when they are needed. The same
-/// config and `max_size` give the same pool, so isolates share it: up to
-/// `max_size` connections for the whole process. Each open needs one
-/// [dpg_close]. Returns a pool handle (> 0), or -1 when the config is bad.
+/// config, `max_size` and `verify` give the same pool, so isolates share
+/// it: up to `max_size` connections for the whole process. Each open needs
+/// one [dpg_close]. Returns a pool handle (> 0), or -1 when the config is
+/// bad.
+///
+/// `verify` 1 checks the server certificate and its host name when TLS is
+/// on (`verify-full`). 0 encrypts without a check (`require`, `prefer`).
 ///
 /// # Safety
 /// `cfg` must point to `len` readable bytes.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn dpg_connect(cfg: *const u8, len: i64, max_size: i64, threads: i64) -> i64 {
+pub unsafe extern "C" fn dpg_connect(
+    cfg: *const u8,
+    len: i64,
+    max_size: i64,
+    threads: i64,
+    verify: i64,
+) -> i64 {
     let cfg = unsafe { std::slice::from_raw_parts(cfg, len as usize) };
     let Ok(cfg) = std::str::from_utf8(cfg) else {
         return -1;
@@ -904,7 +1005,9 @@ pub unsafe extern "C" fn dpg_connect(cfg: *const u8, len: i64, max_size: i64, th
         return -1;
     };
     let max_size = max_size.max(1) as usize;
-    let key = format!("{max_size} {cfg}");
+    let verify = verify != 0;
+    // sslmode is in `cfg`, so the key has all the TLS settings
+    let key = format!("{max_size} {verify} {cfg}");
     runtime(threads.max(0) as usize);
     with(&POOLS, |r| {
         if let Some((handle, shared)) = r.map.iter().find(|(_, s)| s.key == key) {
@@ -913,7 +1016,7 @@ pub unsafe extern "C" fn dpg_connect(cfg: *const u8, len: i64, max_size: i64, th
         }
         let manager = Manager::from_config(
             pg,
-            NoTls,
+            tls(verify),
             ManagerConfig {
                 recycling_method: RecyclingMethod::Fast,
             },
@@ -990,6 +1093,7 @@ pub unsafe extern "C" fn dpg_submit(sink: i64, ptr: *const u8, len: i64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio_postgres::NoTls;
 
     fn request(id: u64, sql: &str, params: &[Option<&str>]) -> Vec<u8> {
         let mut b = Vec::new();
@@ -1068,10 +1172,15 @@ mod tests {
     #[test]
     fn same_config_shares_one_pool_until_the_last_close() {
         let cfg = b"host=127.0.0.1 port=1 user=u dbname=close_test";
-        let open = |max| unsafe { dpg_connect(cfg.as_ptr(), cfg.len() as i64, max, 0) };
-        let (a, b, other) = (open(3), open(3), open(4));
+        let open =
+            |max, verify| unsafe { dpg_connect(cfg.as_ptr(), cfg.len() as i64, max, 0, verify) };
+        let (a, b, other) = (open(3, 0), open(3, 0), open(4, 0));
         assert_eq!(a, b);
         assert_ne!(a, other);
+        // other TLS settings are another pool
+        let checked = open(3, 1);
+        assert_ne!(a, checked);
+        dpg_close(checked);
         let alive = |h: i64| with(&POOLS, |r| r.map.contains_key(&(h as u64)));
         dpg_close(a);
         assert!(alive(a));

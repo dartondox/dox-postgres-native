@@ -5,12 +5,13 @@ import 'dart:isolate';
 import 'dart:typed_data';
 
 import 'package:dox_postgres_native/src/bindings.dart';
-import 'package:dox_postgres_native/src/compat.dart';
-import 'package:postgres/postgres.dart';
+import 'package:dox_postgres_native/src/exceptions.dart';
+import 'package:dox_postgres_native/src/sql.dart';
 
-/// The rows of one query. Values have the same Dart types as with the
-/// `postgres` package (eg. `int`, `String`, `DateTime` in UTC, a decoded
-/// JSON value, `Uint8List` for bytea).
+/// The rows of one query. Values are Dart types: `int`, `double`, `bool`,
+/// `String` (also for `numeric`, `uuid` and `time`), `DateTime` in UTC,
+/// `Duration` for `interval`, a decoded JSON value, `Uint8List` for
+/// `bytea`, and a `List` for an array.
 class PgNativeResult {
   PgNativeResult(this.columns, this.rows);
 
@@ -52,7 +53,7 @@ class PgNativePool {
     int transaction,
     int kind,
     Uint8List sql,
-    List<TypedValue<Object>> values,
+    List<Object?> values,
   ) {
     if (_closed) {
       return Future<T>.error(StateError('PgNativePool is closed'));
@@ -101,6 +102,11 @@ class PgNativePool {
   /// [threads] is the size of the Rust runtime of the whole process. Only
   /// the first pool sets it. 0 runs one `current_thread` runtime on its own
   /// thread.
+  ///
+  /// [sslMode] is like libpq: `disable` (no TLS), `prefer` (TLS when the
+  /// server has it), `require` (TLS, no certificate check) or `verify-full`
+  /// (TLS, the certificate and the host name are checked with the Mozilla
+  /// roots and the roots of the system).
   factory PgNativePool.open({
     String host = 'localhost',
     int port = 5432,
@@ -111,7 +117,23 @@ class PgNativePool {
     String timeZone = 'UTC',
     String? applicationName,
     int threads = 1,
+    String sslMode = 'disable',
   }) {
+    // tokio-postgres knows disable, prefer and require. verify-full is
+    // require with the certificate check on.
+    String? mode = const <String, String>{
+      'disable': 'disable',
+      'prefer': 'prefer',
+      'require': 'require',
+      'verify-full': 'require',
+    }[sslMode];
+    if (mode == null) {
+      throw ArgumentError.value(
+        sslMode,
+        'sslMode',
+        'Must be disable, prefer, require or verify-full',
+      );
+    }
     if (!isAvailable) {
       throw UnsupportedError(
         'dox_postgres_native is not available: $_loadError',
@@ -123,10 +145,11 @@ class PgNativePool {
       'user=${_quote(user)}',
       'password=${_quote(password)}',
       'dbname=${_quote(database)}',
-      // same session time zone as the postgres package
+      // the session time zone, UTC by default
       'options=${_quote('-c TimeZone=$timeZone')}',
-      // same connect timeout as the postgres package
+      // connect timeout in seconds
       'connect_timeout=15',
+      'sslmode=$mode',
       if (applicationName != null)
         'application_name=${_quote(applicationName)}',
     ].join(' ');
@@ -136,6 +159,7 @@ class PgNativePool {
       bytes.length,
       maxConnections,
       threads,
+      sslMode == 'verify-full' ? 1 : 0,
     );
     if (handle <= 0) {
       throw ArgumentError('dox_postgres_native: bad connection config');
@@ -143,16 +167,56 @@ class PgNativePool {
     return PgNativePool.fromHandle(handle);
   }
 
+  /// Makes a pool from a url like
+  /// `postgres://user:password@host:5432/database?sslmode=require`.
+  /// Reads `sslmode` and `application_name` from the query. A missing port
+  /// is 5432.
+  factory PgNativePool.fromUrl(
+    String url, {
+    int maxConnections = 10,
+    String timeZone = 'UTC',
+    int threads = 1,
+  }) {
+    Uri uri = Uri.parse(url);
+    if (uri.scheme != 'postgres' && uri.scheme != 'postgresql') {
+      throw ArgumentError.value(url, 'url', 'Must start with postgres://');
+    }
+    int colon = uri.userInfo.indexOf(':');
+    String user = colon < 0 ? uri.userInfo : uri.userInfo.substring(0, colon);
+    Map<String, String> q = uri.queryParameters;
+    return PgNativePool.open(
+      host: uri.host.isEmpty ? 'localhost' : uri.host,
+      port: uri.hasPort ? uri.port : 5432,
+      user: Uri.decodeComponent(user),
+      password: colon < 0
+          ? ''
+          : Uri.decodeComponent(uri.userInfo.substring(colon + 1)),
+      database: Uri.decodeComponent(
+        uri.path.startsWith('/') ? uri.path.substring(1) : uri.path,
+      ),
+      maxConnections: maxConnections,
+      timeZone: timeZone,
+      applicationName: q['application_name'],
+      threads: threads,
+      sslMode: q['sslmode'] ?? 'disable',
+    );
+  }
+
   static String _quote(String v) =>
       "'${v.replaceAll(r'\', r'\\').replaceAll("'", r"\'")}'";
 
   /// Runs [sql] and returns its rows.
   ///
-  /// [parameters] is a map for `@name` parameters (like `Sql.named`), or a
-  /// list for `$1, $2...`. Values are sent like the `postgres` package
-  /// sends them; a [TypedValue] sets the type.
-  /// Throws [ServerException] (eg. [UniqueViolationException]) for errors
-  /// from the server, [PgException] for others.
+  /// [parameters] is a map for `@name` parameters, or a list for
+  /// `$1, $2...`. A value can be null, `bool`, `int`, `double`, `String`,
+  /// `DateTime`, `Duration` (an interval), `Uint8List` (bytea), a `Map`
+  /// (json) or a `List` (an array, eg. for `int4[]`; its items can be the
+  /// same types, a `Map` item is json). Other types throw [ArgumentError].
+  /// All but `Uint8List` go as text without a type, so the server picks
+  /// the type from the SQL. Add a cast (`@id::int8`) when it can not.
+  ///
+  /// Throws [PgServerException] for errors from the server (eg. code
+  /// `23505` for a unique violation), [PgException] for others.
   Future<PgNativeResult> query(
     String sql, {
     Object? parameters,
@@ -161,13 +225,13 @@ class PgNativePool {
     ParsedSql parsed = parameters is List
         ? ParsedSql.direct(sql)
         : ParsedSql.named(sql);
-    List<TypedValue<Object>> values = parsed.bind(parameters);
+    List<Object?> values = parsed.bind(parameters);
     return _send<PgNativeResult>(transaction, 0, parsed.sql, values);
   }
 
   /// Starts a transaction on one connection. Use its id as `transaction`
   /// of [query], then [commit] or [rollback] it.
-  Future<int> begin() => _send<int>(0, 1, _noSql, const <TypedValue<Object>>[]);
+  Future<int> begin() => _send<int>(0, 1, _noSql, const <Object?>[]);
 
   static final Uint8List _noSql = Uint8List(0);
 
@@ -178,7 +242,7 @@ class PgNativePool {
   Future<void> rollback(int transaction) => _end(transaction, 3);
 
   Future<void> _end(int transaction, int kind) =>
-      _send<void>(transaction, kind, _noSql, const <TypedValue<Object>>[]);
+      _send<void>(transaction, kind, _noSql, const <Object?>[]);
 
   /// Gives back this open of the pool. Isolates that open the same
   /// settings share one pool, and the last [close] closes it for all of
@@ -191,8 +255,6 @@ class PgNativePool {
     dpgClose(handle);
   }
 }
-
-final CodecContext _codec = CodecContext.withDefaults();
 
 /// The link of this isolate to Rust: one sink for the results, and one
 /// buffer for the requests that go out in the next microtask.
@@ -227,7 +289,7 @@ class _Link {
     int tx,
     int kind,
     Uint8List sql,
-    List<TypedValue<Object>> values,
+    List<Object?> values,
   ) {
     int id = _free.isEmpty ? _pending.length : _free.last;
     Completer<T> done = Completer<T>();
@@ -272,11 +334,8 @@ class _Link {
     int tx,
     int kind,
     Uint8List sql,
-    List<TypedValue<Object>> values,
+    List<Object?> values,
   ) {
-    List<(int, int, Object?)> params = <(int, int, Object?)>[
-      for (TypedValue<Object> v in values) _encode(v),
-    ];
     int start = _len;
     _ensure(32);
     ByteData d = _outData;
@@ -285,29 +344,92 @@ class _Link {
     d.setUint64(start + 16, tx, Endian.little);
     d.setUint8(start + 24, kind);
     d.setUint8(start + 25, 0);
-    d.setUint16(start + 26, params.length, Endian.little);
+    d.setUint16(start + 26, values.length, Endian.little);
     d.setUint32(start + 28, sql.length, Endian.little);
     _len += 32;
     _bytes(sql);
-    for ((int, int, Object?) p in params) {
-      _ensure(9);
-      int at = _len;
-      _outData.setUint32(at, p.$1, Endian.little);
-      _outData.setUint8(at + 4, p.$2);
-      _len += 9;
-      Object? data = p.$3;
-      if (data is int) {
-        _digits(data);
-      } else if (data is List<int>) {
-        _bytes(data);
+    try {
+      for (Object? v in values) {
+        _ensure(9);
+        int at = _len;
+        _len += 9;
+        int oid = 0;
+        if (v == null) {
+          _outData.setInt32(at + 5, -1, Endian.little);
+        } else {
+          if (v is Uint8List) {
+            oid = 17; // bytea, binary: the bytes as they are
+            _bytes(v);
+          } else {
+            _text(v, false);
+          }
+          _outData.setInt32(at + 5, _len - at - 9, Endian.little);
+        }
+        _outData.setUint32(at, oid, Endian.little);
+        _outData.setUint8(at + 4, oid == 17 ? 1 : 0);
       }
-      _outData.setInt32(
-        at + 5,
-        data == null ? -1 : _len - at - 9,
-        Endian.little,
+    } catch (_) {
+      _len = start; // a bad value: nothing of this request is sent
+      rethrow;
+    }
+  }
+
+  /// Writes [v] in the Postgres text format. [inArray]: as an item of an
+  /// array literal, so strings get double quotes.
+  void _text(Object? v, bool inArray) {
+    if (v is String) {
+      if (inArray) return _quoted(v);
+      _bytes(utf8.encode(v));
+    } else if (v is int) {
+      _digits(v);
+    } else if (v is double) {
+      // NaN, Infinity and 1e+21 are all valid float text
+      _bytes(v.toString().codeUnits);
+    } else if (v is bool) {
+      _bytes(v ? _true : _false);
+    } else if (v is DateTime) {
+      // ponytail: years before 1 AD are not supported
+      String text = v.toUtc().toIso8601String();
+      _bytes(inArray ? '"$text"'.codeUnits : text.codeUnits);
+    } else if (v is Duration) {
+      _digits(v.inMicroseconds);
+      _bytes(' microseconds'.codeUnits);
+    } else if (v is Map) {
+      String text = json.encode(v);
+      if (inArray) return _quoted(text);
+      _bytes(utf8.encode(text));
+    } else if (v is List && v is! Uint8List) {
+      _ensure(1);
+      _out[_len++] = 0x7b; // {
+      for (int i = 0; i < v.length; i++) {
+        if (i > 0) _bytes(const <int>[0x2c]); // ,
+        Object? item = v[i];
+        if (item == null) {
+          _bytes(_null);
+        } else {
+          _text(item, true);
+        }
+      }
+      _bytes(const <int>[0x7d]); // }
+    } else {
+      throw ArgumentError.value(
+        v,
+        'parameters',
+        'dox_postgres_native can not send a ${v.runtimeType}',
       );
     }
   }
+
+  /// [v] in double quotes, with `\` before `"` and `\`: an array item.
+  void _quoted(String v) {
+    _bytes(
+      utf8.encode('"${v.replaceAll(r'\', r'\\').replaceAll('"', r'\"')}"'),
+    );
+  }
+
+  static final Uint8List _true = Uint8List.fromList('TRUE'.codeUnits);
+  static final Uint8List _false = Uint8List.fromList('FALSE'.codeUnits);
+  static final Uint8List _null = Uint8List.fromList('NULL'.codeUnits);
 
   /// Writes [v] as decimal text, without a String in between.
   void _digits(int v) {
@@ -329,26 +451,6 @@ class _Link {
       v ~/= 10;
     }
     _len = at + n;
-  }
-
-  /// (type oid, format, value) of one parameter, the same bytes the
-  /// `postgres` package sends. The value is the bytes, an `int` to write
-  /// as text, or null for NULL.
-  static (int, int, Object?) _encode(TypedValue<Object> v) {
-    if (v.isSqlNull) return (v.type.oid ?? 0, 0, null);
-    Object? value = v.value;
-    if (v.type == Type.unspecified) {
-      // the common ones without the type registry. An int goes as text
-      // with no type, like the `postgres` package: the server then picks
-      // the type (eg. int4, or text for `WHERE name = $1`).
-      if (value is String) return (0, 0, utf8.encode(value));
-      if (value is int) return (0, 0, value);
-    }
-    Object? e = _codec.typeRegistry.encode(v, _codec);
-    if (e is! EncodedValue) {
-      throw PgException('dox_postgres_native: $value needs an async encoder');
-    }
-    return (v.type.oid ?? 0, e.isBinary ? 1 : 0, e.bytes);
   }
 
   void _flush() {
@@ -387,7 +489,7 @@ class _Link {
           case 0:
             done.complete(_rows(b, d, at, sql));
           case 1:
-            done.completeError(serverException(_fields(b, d, at)));
+            done.completeError(PgServerException.fromFields(_fields(b, d, at)));
           case 2:
             done.completeError(
               PgException(utf8.decode(Uint8List.sublistView(b, at, p))),
@@ -405,13 +507,12 @@ class _Link {
     if (_waiting == 0) _port.keepIsolateAlive = false;
   }
 
-  static List<(int, String)> _fields(Uint8List b, ByteData d, int at) {
+  static Map<int, String> _fields(Uint8List b, ByteData d, int at) {
     int count = b[at++];
-    List<(int, String)> fields = <(int, String)>[];
+    Map<int, String> fields = <int, String>{};
     for (int i = 0; i < count; i++) {
       int len = d.getUint32(at + 1, Endian.little);
-      Uint8List text = Uint8List.sublistView(b, at + 5, at + 5 + len);
-      fields.add((b[at], utf8.decode(text)));
+      fields[b[at]] = utf8.decoder.convert(b, at + 5, at + 5 + len);
       at += 5 + len;
     }
     return fields;
@@ -490,8 +591,8 @@ class _Link {
   );
   static const String _hex = '0123456789abcdef';
 
-  /// One binary value. The common types here, the rest with the type
-  /// registry of the `postgres` package.
+  /// One binary value. A type it does not know comes back as its binary
+  /// bytes (`Uint8List`).
   static Object? _decode(int oid, Uint8List b, ByteData d, int at, int len) {
     switch (oid) {
       case 16: // bool
@@ -516,6 +617,7 @@ class _Link {
             isUtc: true,
           );
         }
+        return micros > 0 ? 'infinity' : '-infinity';
       case 1082: // date
         int days = d.getInt32(at);
         if (days != 0x7fffffff && days != -0x80000000) {
@@ -524,6 +626,7 @@ class _Link {
             isUtc: true,
           );
         }
+        return days > 0 ? 'infinity' : '-infinity';
       case 2950 when len == 16: // uuid
         return _uuid(b, at);
       case 1700: // numeric
@@ -532,15 +635,80 @@ class _Link {
         return _json.convert(Uint8List.sublistView(b, at, at + len));
       case 3802 when len > 0 && b[at] == 1: // jsonb, version 1
         return _json.convert(Uint8List.sublistView(b, at + 1, at + len));
+      case 1186 when len == 16: // interval
+        // ponytail: a month is 30 days, like Postgres justify_days
+        return Duration(
+          microseconds: d.getInt64(at),
+          days: d.getInt32(at + 8) + 30 * d.getInt32(at + 12),
+        );
+      case 1083: // time, as text like Postgres: 13:45:01.5
+        return _time(d.getInt64(at));
+      case 26: // oid
+        return d.getUint32(at);
+      case 18 || 142: // "char", xml
+        return utf8.decoder.convert(b, at, at + len);
+      case 1000 || // bool[]
+          1005 || // int2[]
+          1007 || // int4[]
+          1016 || // int8[]
+          1009 || // text[]
+          1015 || // varchar[]
+          1014 || // bpchar[]
+          1021 || // float4[]
+          1022 || // float8[]
+          1231 || // numeric[]
+          1182 || // date[]
+          1115 || // timestamp[]
+          1185 || // timestamptz[]
+          1183 || // time[]
+          1187 || // interval[]
+          2951 || // uuid[]
+          199 || // json[]
+          3807 || // jsonb[]
+          1001 || // bytea[]
+          1003: // name[]
+        return _array(b, d, at);
     }
-    // a copy: the value must not keep the whole batch alive
-    Uint8List bytes = Uint8List.fromList(
-      Uint8List.sublistView(b, at, at + len),
-    );
-    return _codec.typeRegistry.decode(
-      EncodedValue.binary(bytes, typeOid: oid),
-      _codec,
-    );
+    // bytea, and the types it does not know. A copy: the value must not
+    // keep the whole batch alive.
+    return Uint8List.fromList(Uint8List.sublistView(b, at, at + len));
+  }
+
+  /// An array: i32 dimensions, i32 has nulls, u32 item type, per dimension
+  /// i32 size and i32 lower bound, then per item i32 length and bytes. More
+  /// dimensions give lists in lists.
+  static List<Object?> _array(Uint8List b, ByteData d, int at) {
+    int dims = d.getInt32(at);
+    int oid = d.getUint32(at + 8);
+    if (dims == 0) return <Object?>[];
+    List<int> sizes = <int>[
+      for (int i = 0; i < dims; i++) d.getInt32(at + 12 + 8 * i),
+    ];
+    int p = at + 12 + 8 * dims;
+    List<Object?> read(int dim) {
+      return List<Object?>.generate(sizes[dim], (_) {
+        if (dim + 1 < dims) return read(dim + 1);
+        int len = d.getInt32(p);
+        p += 4;
+        if (len < 0) return null;
+        Object? v = _decode(oid, b, d, p, len);
+        p += len;
+        return v;
+      });
+    }
+
+    return read(0);
+  }
+
+  /// micros since midnight as `HH:MM:SS`, with `.ffffff` when it has them
+  static String _time(int micros) {
+    String two(int v) => v.toString().padLeft(2, '0');
+    int s = micros ~/ 1000000;
+    int f = micros % 1000000;
+    String out = '${two(s ~/ 3600)}:${two(s ~/ 60 % 60)}:${two(s % 60)}';
+    if (f == 0) return out;
+    String frac = f.toString().padLeft(6, '0').replaceFirst(RegExp(r'0+$'), '');
+    return '$out.$frac';
   }
 
   /// `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`, lower case

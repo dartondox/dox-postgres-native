@@ -23,8 +23,8 @@ Dox 3.x is in alpha (`3.0.0-alpha.x`). The API can still change before the stabl
 
 - Rust ([tokio-postgres](https://docs.rs/tokio-postgres)) owns the connections and the pool.
 - Your models and queries stay in Dart. You do not change any config.
-- Values have the same Dart types as with the `postgres` package.
-- Server errors are the same `ServerException` classes.
+- It does not use the Dart `postgres` package. It has its own `@name` parser and value encoder.
+- Server errors are `PgServerException`, other errors are `PgException`.
 
 ## The native library
 
@@ -37,7 +37,7 @@ A build hook (`hook/build.dart`) gets the Rust library. It tries these in order:
 The hook has no sha256 list for ready-built libraries yet, because no `dox_postgres_native-v*` release exists yet.
 The release workflow builds them for macOS, Linux and Windows on such a tag.
 So step 2 is skipped, and you need Rust to get the native driver.
-Without Rust, the ORM uses the Dart `postgres` driver and prints one warning line.
+There is no Dart driver to fall back to.
 
 Use `dart run`, `dart test` or `dart build cli`. `dart compile exe` does not run build hooks.
 
@@ -61,10 +61,44 @@ void main() async {
 }
 ```
 
-## Turn it off
+Or from a url:
 
-- For all connections: set the env var `DOX_DB_DRIVER=dart`.
-- For one connection: `extra: <String, dynamic>{'native': false}` in its `ConnectionConfig`.
+```dart
+PgNativePool pool = PgNativePool.fromUrl(
+  'postgres://user:password@db.example.com:5432/app?sslmode=verify-full',
+);
+```
+
+## Parameter values
+
+`null`, `bool`, `int`, `double`, `String`, `DateTime`, `Duration` (an interval), `Uint8List` (bytea), `Map` (json) and `List` (an array, eg. for `int4[]`).
+Another type throws `ArgumentError`. So does a map that misses an `@name` of the SQL, or has a name the SQL does not use.
+
+All values but `Uint8List` go as text without a type, so the server picks the type.
+Add a cast when it can not, eg. `@id::int8` or `@id:int8`.
+For a json column, a `List` is an array, not json: send `jsonEncode(list)`.
+
+## Errors
+
+```dart
+try {
+  await pool.query('INSERT INTO users (email) VALUES (@e)', parameters: {'e': e});
+} on PgServerException catch (error) {
+  if (error.code == '23505') print('taken: ${error.constraint}');
+}
+```
+
+- `PgServerException`: the server said no. It has `code` (SQLSTATE), `severity`, `message`, and `detail`, `hint`, `schema`, `table`, `column`, `constraint` when the server sends them.
+- `PgException`: everything else, eg. no connection, a TLS error, a timeout.
+
+## TLS
+
+`sslMode` of `PgNativePool.open` (or `sslmode` in the url):
+
+- `disable` (the default): no TLS.
+- `prefer`: TLS when the server has it, no certificate check.
+- `require`: TLS, no certificate check.
+- `verify-full`: TLS, and the certificate and host name are checked. It uses the Mozilla roots and the roots of the system.
 
 ## Features
 
@@ -72,7 +106,7 @@ void main() async {
 - Each connection keeps its prepared statements.
 - Transactions: `pool.begin()`, `pool.commit(tx)`, `pool.rollback(tx)`.
 - Parameters as a map for `@name`, or a list for `$1, $2`.
-- Not yet: TLS. A connection with `useSSL: true` uses the Dart driver.
+- TLS with rustls.
 
 ## Documentation
 

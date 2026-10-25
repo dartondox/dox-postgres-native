@@ -3,7 +3,6 @@ import 'dart:isolate';
 import 'dart:typed_data';
 
 import 'package:dox_postgres_native/dox_postgres_native.dart';
-import 'package:postgres/postgres.dart';
 import 'package:test/test.dart';
 
 // Postgres like in CI. DB_PORT=5472 dart test, for another port.
@@ -18,23 +17,11 @@ PgNativePool openNative() => PgNativePool.open(
   database: 'postgres',
 );
 
-typedef Rows = List<Map<String, dynamic>>;
-
 void main() {
   late PgNativePool native;
-  late Pool<dynamic> dart;
 
   setUpAll(() async {
     native = openNative();
-    dart = Pool<dynamic>.withEndpoints(<Endpoint>[
-      Endpoint(
-        host: host,
-        port: port,
-        username: 'postgres',
-        password: 'postgres',
-        database: 'postgres',
-      ),
-    ], settings: PoolSettings(sslMode: SslMode.disable));
     await native.query('DROP TABLE IF EXISTS pgn_types');
     await native.query('''
       CREATE TABLE pgn_types (
@@ -44,24 +31,13 @@ void main() {
         ts timestamp, tz timestamptz, d date,
         j json, jb jsonb, u uuid, by bytea,
         ai int4[], at text[], ab bool[], af float8[], ats timestamptz[],
-        iv interval
+        iv interval, tm time
       )''');
   });
 
   tearDownAll(() async {
     await native.query('DROP TABLE IF EXISTS pgn_types');
-    await dart.close();
   });
-
-  /// rows of [sql] from both drivers
-  Future<(Rows, Rows)> both(String sql, [Map<String, dynamic>? params]) async {
-    PgNativeResult n = await native.query(sql, parameters: params);
-    Result d = await dart.execute(Sql.named(sql), parameters: params);
-    return (
-      n.rows,
-      <Map<String, dynamic>>[for (ResultRow r in d) r.toColumnMap()],
-    );
-  }
 
   Map<String, dynamic> values = <String, dynamic>{
     'i2': 7,
@@ -86,60 +62,68 @@ void main() {
     },
     'u': 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11',
     'by': Uint8List.fromList(<int>[0, 1, 2, 255]),
-    'ai': <int>[1, 2, 3],
-    'at': <String>['a', 'b c', 'd"e'],
+    'ai': <int?>[1, null, 3],
+    'at': <String>['a', 'b c', 'd"e', r'f\g', ''],
     'ab': <bool>[true, false],
     'af': <double>[1.25, -2.5],
     'ats': <DateTime>[DateTime.utc(2020, 5, 6, 7, 8, 9)],
+    'iv': const Duration(days: 1, hours: 2, microseconds: 3),
+    'tm': '13:45:01.5',
   };
   String cols = values.keys.join(', ');
   String marks = values.keys.map((String k) => '@$k').join(', ');
 
-  test('every type comes back like with the postgres package', () async {
+  test('every type goes in and comes back', () async {
     await native.query(
       'INSERT INTO pgn_types ($cols) VALUES ($marks)',
       parameters: values,
     );
-    await dart.execute(
-      Sql.named('INSERT INTO pgn_types ($cols) VALUES ($marks)'),
-      parameters: values,
-    );
     await native.query('INSERT INTO pgn_types (t) VALUES (NULL)');
-    await native.query("UPDATE pgn_types SET iv = '1 day 2 hours'");
-
-    (Rows, Rows) r = await both('SELECT * FROM pgn_types ORDER BY id');
-    Rows n = r.$1;
-    Rows d = r.$2;
-    expect(n, hasLength(3));
-    expect(n, equals(d));
-    // native insert and Dart insert stored the same values
-    Map<String, dynamic> a = Map<String, dynamic>.of(n[0])..remove('id');
-    Map<String, dynamic> b = Map<String, dynamic>.of(n[1])..remove('id');
-    expect(a, equals(b));
-    expect(n[0]['i8'], 9007199254740993);
-    expect(n[0]['ts'], values['ts']);
+    List<Map<String, dynamic>> n = (await native.query(
+      'SELECT * FROM pgn_types ORDER BY id',
+    )).rows;
+    expect(n, hasLength(2));
+    Map<String, dynamic> row = Map<String, dynamic>.of(n[0])..remove('id');
+    // bpchar keeps its padding
+    expect(row, equals(<String, dynamic>{...values, 'bp': 'ab '}));
     expect(
-      n[0]['tz'],
+      row['tz'],
       isA<DateTime>().having((DateTime t) => t.isUtc, 'utc', true),
     );
-    expect(n[0]['by'], isA<Uint8List>());
-    expect(n[0]['ai'], <int>[1, 2, 3]);
-    expect(n[0]['j'], values['j']);
-    expect(n[0]['iv'], isA<Interval>());
-    expect(n[2]['t'], isNull);
-    expect(n[2]['ai'], isNull);
+    expect(row['by'], isA<Uint8List>());
+    expect(n[1]['t'], isNull);
+    expect(n[1]['ai'], isNull);
+  });
+
+  test('numeric keeps all its digits', () async {
+    List<String> same = <String>[
+      '0',
+      '12345.678900',
+      '10000',
+      '100000000.5',
+      '-42',
+      '0.00001234',
+      '-0.5',
+      '123456789012345678901234567890.123456789',
+      'NaN',
+    ];
+    for (String v in same) {
+      PgNativeResult r = await native.query(
+        'SELECT @v::numeric AS n',
+        parameters: <String, dynamic>{'v': v},
+      );
+      expect(r.rows.single['n'], v);
+    }
   });
 
   test('expressions, null params and the select order', () async {
-    (Rows, Rows) r = await both(
+    PgNativeResult r = await native.query(
       'SELECT @a::int + 1 AS x, @b::text AS y, @c AS z, 2 AS a, 1 AS b, '
-      "'@not' AS lit, NULL::int AS nothing",
-      <String, dynamic>{'a': 41, 'b': null, 'c': 'zz'},
+      "'@not' AS lit, NULL::int AS nothing, @t::bool AS yes",
+      parameters: <String, dynamic>{'a': 41, 'b': null, 'c': 'zz', 't': true},
     );
-    Rows n = r.$1;
-    Rows d = r.$2;
-    expect(n, equals(d));
-    expect(n.single.keys.toList(), <String>[
+    Map<String, dynamic> row = r.rows.single;
+    expect(row.keys.toList(), <String>[
       'x',
       'y',
       'z',
@@ -147,18 +131,34 @@ void main() {
       'b',
       'lit',
       'nothing',
+      'yes',
     ]);
-    expect(n.single['x'], 42);
-    expect(n.single['lit'], '@not');
+    expect(row, <String, dynamic>{
+      'x': 42,
+      'y': null,
+      'z': 'zz',
+      'a': 2,
+      'b': 1,
+      'lit': '@not',
+      'nothing': null,
+      'yes': true,
+    });
   });
 
-  test('typed values and positional params', () async {
+  test('positional params, and a value it can not send', () async {
     PgNativeResult r = await native.query(
-      r'SELECT $1 AS a, $2 AS b',
-      parameters: <Object?>[TypedValue<int>(Type.integer, 5), 'x'],
+      r'SELECT $1::int AS a, $2 AS b',
+      parameters: <Object?>[5, 'x'],
     );
     expect(r.rows.single, <String, dynamic>{'a': 5, 'b': 'x'});
     expect(r.columns, <String>['a', 'b']);
+    expect(
+      () => native.query(r'SELECT $1', parameters: <Object?>[Object()]),
+      throwsArgumentError,
+    );
+    // the bad request was not sent: the next one still works
+    PgNativeResult ok = await native.query('SELECT 1 AS n');
+    expect(ok.rows.single['n'], 1);
   });
 
   test('the cached plan is renewed after ALTER TABLE', () async {
@@ -193,7 +193,7 @@ void main() {
     });
   });
 
-  group('errors have the shape of the postgres package', () {
+  group('errors', () {
     Future<Object> fail(Future<Object?> Function() run) async {
       try {
         await run();
@@ -203,36 +203,39 @@ void main() {
       throw TestFailure('no error');
     }
 
-    test('unique violation', () async {
+    test('unique violation has the server fields', () async {
       await native.query('DROP TABLE IF EXISTS pgn_uniq');
       await native.query('CREATE TABLE pgn_uniq (k int PRIMARY KEY)');
       await native.query('INSERT INTO pgn_uniq VALUES (1)');
-      String sql = 'INSERT INTO pgn_uniq VALUES (@k)';
-      Map<String, dynamic> p = <String, dynamic>{'k': 1};
-      Object n = await fail(() => native.query(sql, parameters: p));
-      Object d = await fail(() => dart.execute(Sql.named(sql), parameters: p));
-      expect(n, isA<UniqueViolationException>());
-      expect(d, isA<UniqueViolationException>());
-      expect(n.toString(), d.toString());
-      ServerException e = n as ServerException;
+      Object n = await fail(
+        () => native.query(
+          'INSERT INTO pgn_uniq VALUES (@k)',
+          parameters: <String, dynamic>{'k': 1},
+        ),
+      );
+      expect(n, isA<PgServerException>());
+      PgServerException e = n as PgServerException;
       expect(e.code, '23505');
-      expect(e.constraintName, 'pgn_uniq_pkey');
-      expect(e.tableName, 'pgn_uniq');
-      expect(e.severity, Severity.error);
+      expect(e.severity, 'ERROR');
+      expect(e.constraint, 'pgn_uniq_pkey');
+      expect(e.table, 'pgn_uniq');
+      expect(e.schema, 'public');
+      expect(e.detail, 'Key (k)=(1) already exists.');
+      expect(e.message, contains('duplicate key'));
+      expect('$e', contains('23505'));
+      expect('$e', contains('pgn_uniq_pkey'));
       await native.query('DROP TABLE pgn_uniq');
     });
 
     test('syntax error and missing table', () async {
-      for (String sql in <String>['SELEC 1', 'SELECT * FROM pgn_nope']) {
-        Object n = await fail(() => native.query(sql));
-        Object d = await fail(() => dart.execute(sql));
-        expect(n, isA<ServerException>());
-        expect(n.runtimeType, d.runtimeType);
-        expect(n.toString(), d.toString());
-        expect(
-          (n as ServerException).position,
-          (d as ServerException).position,
-        );
+      Map<String, String> codes = <String, String>{
+        'SELEC 1': '42601',
+        'SELECT * FROM pgn_nope': '42P01',
+      };
+      for (MapEntry<String, String> c in codes.entries) {
+        Object n = await fail(() => native.query(c.key));
+        expect(n, isA<PgServerException>());
+        expect((n as PgServerException).code, c.value);
       }
     });
 
@@ -266,7 +269,7 @@ void main() {
       expect('$closed', contains('closed'));
     });
 
-    test('a wrong password is a fatal ServerException', () async {
+    test('a wrong password is a fatal PgServerException', () async {
       PgNativePool bad = PgNativePool.open(
         host: host,
         port: port,
@@ -275,10 +278,36 @@ void main() {
         database: 'postgres',
       );
       Object e = await fail(() => bad.query('SELECT 1'));
-      expect(e, isA<ServerException>());
-      expect((e as ServerException).code, '28P01');
-      expect(e.severity, Severity.fatal);
+      expect(e, isA<PgServerException>());
+      expect((e as PgServerException).code, '28P01');
+      expect(e.severity, 'FATAL');
       bad.close();
+    });
+
+    test('sslMode require on a server without TLS is a PgException', () async {
+      PgNativePool tls = PgNativePool.open(
+        host: host,
+        port: port,
+        user: 'postgres',
+        password: 'postgres',
+        database: 'postgres',
+        sslMode: 'require',
+      );
+      Object e = await fail(() => tls.query('SELECT 1'));
+      expect(e, isA<PgException>());
+      expect(e, isNot(isA<PgServerException>()));
+      expect('$e', contains('TLS'));
+      tls.close();
+      // prefer falls back to no TLS
+      PgNativePool prefer = PgNativePool.fromUrl(
+        'postgres://postgres:postgres@$host:$port/postgres?sslmode=prefer',
+      );
+      expect((await prefer.query('SELECT 1 AS n')).rows.single['n'], 1);
+      prefer.close();
+      expect(
+        () => PgNativePool.open(user: 'u', database: 'd', sslMode: 'verify-ca'),
+        throwsArgumentError,
+      );
     });
   });
 
