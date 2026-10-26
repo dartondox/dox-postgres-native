@@ -3,7 +3,7 @@ name: CI
 # Every push to main and every pull request: Rust checks, then the Dart
 # tests.
 #
-# A tag like v3.0.0-alpha.7 (it must match the version in pubspec.yaml):
+# A tag like v<version> (it must match the version in pubspec.yaml):
 # 1. build the library for the 5 targets,
 # 2. upload them to the GitHub release of the tag, with SHA256SUMS,
 # 3. fill `_sha256` in hook/build.dart from SHA256SUMS, publish the package
@@ -118,7 +118,7 @@ jobs:
         run: |
           sha256sum "$LIB"-* > SHA256SUMS
           cat SHA256SUMS
-          # a version with "-" (like 3.0.0-alpha.7) is a prerelease
+          # a version with "-" in it is a prerelease
           pre=()
           case "$TAG" in *-*) pre=(--prerelease) ;; esac
           # a re-run replaces the files of the release
