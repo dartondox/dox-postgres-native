@@ -1,3 +1,7 @@
+## 3.0.0
+
+- The first stable release.
+
 ## 3.0.0-alpha.8
 
 - New `sslRootCert` option of `PgNativePool.open`: the path of a PEM file with the CA certificates to trust, like libpq `sslrootcert`. Use it for a private CA, eg. AWS RDS, Google Cloud SQL, Azure, or a self-signed dev setup. With it, only the certificates in that file are trusted. `fromUrl` reads `sslrootcert=` from the url.

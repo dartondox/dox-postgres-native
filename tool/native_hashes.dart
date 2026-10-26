@@ -2,7 +2,7 @@
 // The release workflow (.github/workflows/ci.yaml) runs it before it
 // publishes. You can also run it by hand:
 //
-//   dart run tool/native_hashes.dart v3.0.0-alpha.7
+//   dart run tool/native_hashes.dart v<version>
 //
 // It downloads `SHA256SUMS` of the release and writes the hashes into
 // hook/build.dart.
