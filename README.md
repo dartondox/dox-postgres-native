@@ -17,7 +17,7 @@ Add it only to use the pool without the ORM:
 dart pub add dox_postgres_native
 ```
 
-Dox 3.x is in alpha (`3.0.0-alpha.x`). The API can still change before the stable release.
+To see what is ready and what may still change, read [Status and roadmap](https://dartondox.dev/latest/concepts/status-and-roadmap/).
 
 ## How it works
 
