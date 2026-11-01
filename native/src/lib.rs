@@ -611,6 +611,19 @@ impl rustls::client::danger::ServerCertVerifier for Verifier {
 
 // ---- FFI ---------------------------------------------------------------
 
+/// `len` bytes at `ptr` from Dart. A negative `len` or a null `ptr` is an
+/// empty slice: `len as usize` of a negative number is a huge length.
+///
+/// # Safety
+/// When `len` > 0 and `ptr` is not null, `ptr` must point to `len`
+/// readable bytes that live for `'a`.
+pub(crate) unsafe fn bytes<'a>(ptr: *const u8, len: i64) -> &'a [u8] {
+    if ptr.is_null() || len <= 0 {
+        return &[];
+    }
+    unsafe { std::slice::from_raw_parts(ptr, len as usize) }
+}
+
 /// ABI version of this library. Dart checks it at load.
 #[unsafe(no_mangle)]
 pub extern "C" fn dpg_version() -> i32 {
@@ -675,12 +688,11 @@ pub unsafe extern "C" fn dpg_connect(
     err: *mut u8,
     err_cap: i64,
 ) -> i64 {
-    let cfg = unsafe { std::slice::from_raw_parts(cfg, len as usize) };
-    let root_cert = if root_len > 0 {
-        unsafe { std::slice::from_raw_parts(root_cert, root_len as usize) }
-    } else {
-        &[]
-    };
+    if len < 0 || root_len < 0 {
+        return -1;
+    }
+    let cfg = unsafe { bytes(cfg, len) };
+    let root_cert = unsafe { bytes(root_cert, root_len) };
     let (Ok(text), Ok(root_cert)) = (std::str::from_utf8(cfg), std::str::from_utf8(root_cert))
     else {
         return -1;
@@ -858,6 +870,28 @@ mod tests {
             ),
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn negative_ffi_lengths_are_refused() {
+        let cfg = b"host=127.0.0.1 port=1 user=u dbname=neg_test";
+        let open = |len, root_len| unsafe {
+            dpg_connect(
+                cfg.as_ptr(),
+                len,
+                1,
+                0,
+                cfg.as_ptr(),
+                root_len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        assert_eq!(open(-1, 0), -1);
+        assert_eq!(open(cfg.len() as i64, -5), -1);
+        assert!(unsafe { bytes(cfg.as_ptr(), -1) }.is_empty());
+        assert!(unsafe { bytes(std::ptr::null(), 4) }.is_empty());
+        assert_eq!(unsafe { bytes(cfg.as_ptr(), 4) }, b"host");
     }
 
     #[test]

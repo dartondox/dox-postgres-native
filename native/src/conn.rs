@@ -63,12 +63,27 @@ const SPARE_SIZE: usize = 16 * 1024;
 const GONE: &[u8] = b"26000";
 const STALE: &[u8] = b"0A000";
 
-fn be16(b: &[u8], p: usize) -> usize {
-    u16::from_be_bytes([b[p], b[p + 1]]) as usize
+/// The error for a message that is too short or broken. Release builds
+/// abort on a panic, so the parser must never index out of bounds.
+fn bad() -> Fail {
+    Fail::text("dox_postgres_native: bad message from the server")
 }
 
-fn be32(b: &[u8], p: usize) -> u32 {
-    u32::from_be_bytes(b[p..p + 4].try_into().unwrap())
+/// `n` bytes of `b` at `p`, or an error when they are not there.
+fn take(b: &[u8], p: usize, n: usize) -> Result<&[u8], Fail> {
+    p.checked_add(n)
+        .and_then(|end| b.get(p..end))
+        .ok_or_else(bad)
+}
+
+fn be16(b: &[u8], p: usize) -> Result<usize, Fail> {
+    let s = take(b, p, 2)?;
+    Ok(u16::from_be_bytes([s[0], s[1]]) as usize)
+}
+
+fn be32(b: &[u8], p: usize) -> Result<u32, Fail> {
+    let s = take(b, p, 4)?;
+    Ok(u32::from_be_bytes([s[0], s[1], s[2], s[3]]))
 }
 
 /// The next whole backend message at `p`: its tag and its body. None when
@@ -77,11 +92,9 @@ fn frame(b: &[u8], p: usize) -> Result<Option<(u8, &[u8])>, Fail> {
     if p + 5 > b.len() {
         return Ok(None);
     }
-    let len = be32(b, p + 1) as usize;
+    let len = be32(b, p + 1)? as usize;
     if len < 4 {
-        return Err(Fail::text(
-            "dox_postgres_native: bad message from the server",
-        ));
+        return Err(bad());
     }
     if p + 1 + len > b.len() {
         return Ok(None);
@@ -126,40 +139,39 @@ fn error_code(b: &[u8]) -> &[u8] {
 
 /// A RowDescription body as the column part of a status 0 record: u16
 /// count, per column u32 type oid, u16 name length, name.
-fn columns(b: &[u8]) -> Vec<u8> {
-    let count = be16(b, 0);
+fn columns(b: &[u8]) -> Result<Vec<u8>, Fail> {
+    let count = be16(b, 0)?;
     let mut out = Vec::with_capacity(2 + count * 16);
     out.extend_from_slice(&(count as u16).to_le_bytes());
     let mut p = 2;
     for _ in 0..count {
-        let end = b[p..]
-            .iter()
-            .position(|&c| c == 0)
-            .map_or(b.len(), |e| p + e);
+        let rest = b.get(p..).ok_or_else(bad)?;
+        let end = rest.iter().position(|&c| c == 0).ok_or_else(bad)? + p;
         let name = &b[p..end];
         // after the name: table oid u32, column i16, type oid u32, ...
-        let oid = be32(b, end + 7);
+        let oid = be32(b, end + 7)?;
         out.extend_from_slice(&oid.to_le_bytes());
         out.extend_from_slice(&(name.len() as u16).to_le_bytes());
         out.extend_from_slice(name);
         p = end + 19;
     }
-    out
+    Ok(out)
 }
 
 /// Adds the values of a DataRow body: per value i32 length (little
 /// endian, -1 NULL), bytes.
-fn row(out: &mut Vec<u8>, b: &[u8]) {
+fn row(out: &mut Vec<u8>, b: &[u8]) -> Result<(), Fail> {
     let mut p = 2;
-    for _ in 0..be16(b, 0) {
-        let len = be32(b, p) as i32;
+    for _ in 0..be16(b, 0)? {
+        let len = be32(b, p)? as i32;
         out.extend_from_slice(&len.to_le_bytes());
         p += 4;
         if len > 0 {
-            out.extend_from_slice(&b[p..p + len as usize]);
+            out.extend_from_slice(take(b, p, len as usize)?);
             p += len as usize;
         }
     }
+    Ok(())
 }
 
 fn connect_error(e: impl std::fmt::Display) -> Fail {
@@ -980,12 +992,13 @@ impl Conn {
             b'R' => {
                 let pool = self.pool.clone();
                 let c = &pool.cfg;
-                let data = &body[4..];
-                match be32(body, 0) {
+                let data = body.get(4..).ok_or_else(bad)?;
+                match be32(body, 0)? {
                     0 => {} // AuthenticationOk
                     3 => frontend::password_message(&c.password, &mut self.out).map_err(enc)?,
                     5 => {
-                        let salt = data[..4].try_into().unwrap();
+                        let s = take(data, 0, 4)?;
+                        let salt = [s[0], s[1], s[2], s[3]];
                         let hash = md5_hash(c.user.as_bytes(), &c.password, salt);
                         frontend::password_message(hash.as_bytes(), &mut self.out).map_err(enc)?;
                     }
@@ -1069,12 +1082,12 @@ impl Conn {
             };
             match tag {
                 b'D' => {
-                    row(&mut w.rows, body);
+                    row(&mut w.rows, body)?;
                     w.count += 1;
                 }
                 b'T' | b'n' => {
                     let cols = if tag == b'T' {
-                        columns(body)
+                        columns(body)?
                     } else {
                         vec![0, 0]
                     };
@@ -1180,10 +1193,10 @@ mod tests {
         t.extend_from_slice(&[0, 0, 0, 0, 0, 0]); // table oid, column
         t.extend_from_slice(&23u32.to_be_bytes());
         t.extend_from_slice(&[0, 4, 0, 0, 0, 0, 0, 1]); // size, mod, format
-        assert_eq!(columns(&t), [1, 0, 23, 0, 0, 0, 1, 0, b'n']);
+        assert_eq!(columns(&t).unwrap(), [1, 0, 23, 0, 0, 0, 1, 0, b'n']);
         let mut out = Vec::new();
-        row(&mut out, &[0, 1, 0, 0, 0, 4, 0, 0, 0, 42]);
-        row(&mut out, &[0, 1, 255, 255, 255, 255]);
+        row(&mut out, &[0, 1, 0, 0, 0, 4, 0, 0, 0, 42]).unwrap();
+        row(&mut out, &[0, 1, 255, 255, 255, 255]).unwrap();
         assert_eq!(out, [4, 0, 0, 0, 0, 0, 0, 42, 255, 255, 255, 255]);
         let e = b"SERROR\0C42P01\0Mno table\0\0";
         assert_eq!(error_code(e), b"42P01");
@@ -1194,6 +1207,26 @@ mod tests {
         let msg = [b'Z', 0, 0, 0, 5, b'I'];
         assert_eq!(frame(&msg, 0).unwrap(), Some((b'Z', &b"I"[..])));
         assert_eq!(frame(&msg[..5], 0).unwrap(), None);
+    }
+
+    #[test]
+    fn short_or_broken_messages_are_errors_not_panics() {
+        // RowDescription: no count, a name with no end, no type oid
+        assert!(columns(&[]).is_err());
+        assert!(columns(&[0, 1, b'n']).is_err());
+        assert!(columns(&[0, 1, b'n', 0, 0, 0]).is_err());
+        assert!(columns(&[0, 2]).is_err());
+        // DataRow: no count, no length, a length past the end
+        let mut out = Vec::new();
+        assert!(row(&mut out, &[]).is_err());
+        assert!(row(&mut out, &[0, 1, 0, 0]).is_err());
+        assert!(row(&mut out, &[0, 1, 0, 0, 0, 9, 1, 2]).is_err());
+        assert!(row(&mut out, &[0, 1, 127, 255, 255, 255]).is_err());
+        assert!(be16(&[1], 0).is_err());
+        assert!(be32(&[1, 2, 3], 0).is_err());
+        assert!(be32(&[1, 2, 3, 4], usize::MAX).is_err());
+        // a frame with a length below 4
+        assert!(frame(&[b'Z', 0, 0, 0, 3, 0], 0).is_err());
     }
 
     fn stmt(used: u64) -> Stmt {
