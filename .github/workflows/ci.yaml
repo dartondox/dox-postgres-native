@@ -47,8 +47,6 @@ jobs:
       # the build is kept: the Dart build hook uses native/target/release
       - name: Rust checks
         working-directory: native
-        env:
-          PG_URL: postgres://postgres:postgres@localhost:5432/postgres
         run: |
           cargo fmt --check
           cargo clippy --release --all-targets -- -D warnings

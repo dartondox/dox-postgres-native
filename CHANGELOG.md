@@ -5,9 +5,9 @@
 - `maxConnections` is still the limit for the whole process. When one isolate waits for a connection, the other isolates give their idle ones to the pool. No isolate waits forever while another keeps connections it does not use.
 - A dead isolate (eg. killed, or an uncaught error) now closes its connections within about 100 ms. An open transaction of it is rolled back by the server.
 - The `threads` option of `PgNativePool.open` and `fromUrl` does nothing now. It stays so code that sets it still works.
-- A transaction works in the isolate that started it. Use its id in that isolate.
+- A transaction id still works in any isolate. Its requests go to the isolate that started it, and the answers come back.
 - The host name is looked up when the pool opens, and again on a background thread after a connect fails (eg. after a database failover moves the name to another IP). The isolate never waits for DNS.
-- The native ABI version is now 6 (`dpg_connect` has no `threads`; `dpg_open`, `dpg_submit` and `dpg_run` work on the link of one isolate).
+- The native ABI version is now 6 (`dpg_connect` has no `threads`; `dpg_open`, `dpg_submit` and `dpg_run` work on the link of one isolate; the leaf calls never call the Dart API).
 
 ## 3.0.0
 
