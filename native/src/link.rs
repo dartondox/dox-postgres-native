@@ -1011,7 +1011,7 @@ pub unsafe extern "C" fn dpg_submit(link: i64, ptr: *const u8, len: i64) -> i64 
     if s.stopped.load(Ordering::Acquire) {
         return 0;
     }
-    let b = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
+    let b = unsafe { crate::bytes(ptr, len) };
     // one copy of the batch: Dart reuses its buffer after this call.
     // Requests keep slices of it (for a retry, or until a connection is
     // ready).

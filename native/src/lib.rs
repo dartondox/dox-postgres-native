@@ -491,6 +491,19 @@ enum Check {
     Chain,
 }
 
+impl Check {
+    /// The check for the `verify` value from Dart: 0 none, 2 the chain.
+    /// Any other value is the full check, so a bad value can not turn the
+    /// check off.
+    fn of(verify: i64) -> Check {
+        match verify {
+            0 => Check::None,
+            2 => Check::Chain,
+            _ => Check::Full,
+        }
+    }
+}
+
 /// The CA certificates to trust. With `root_cert` (a PEM file path), only
 /// the certificates in that file, like libpq `sslrootcert`. Without it,
 /// the Mozilla roots and the roots of the system.
@@ -611,6 +624,19 @@ impl rustls::client::danger::ServerCertVerifier for Verifier {
 
 // ---- FFI ---------------------------------------------------------------
 
+/// `len` bytes at `ptr` from Dart. A negative `len` or a null `ptr` is an
+/// empty slice: `len as usize` of a negative number is a huge length.
+///
+/// # Safety
+/// When `len` > 0 and `ptr` is not null, `ptr` must point to `len`
+/// readable bytes that live for `'a`.
+pub(crate) unsafe fn bytes<'a>(ptr: *const u8, len: i64) -> &'a [u8] {
+    if ptr.is_null() || len <= 0 {
+        return &[];
+    }
+    unsafe { std::slice::from_raw_parts(ptr, len as usize) }
+}
+
 /// ABI version of this library. Dart checks it at load.
 #[unsafe(no_mangle)]
 pub extern "C" fn dpg_version() -> i32 {
@@ -655,7 +681,7 @@ pub unsafe extern "C" fn dpg_init(data: *mut c_void) -> i32 {
 ///
 /// `verify` checks the server certificate when TLS is on: 0 no check
 /// (`require`, `prefer`), 1 the chain and the host name (`verify-full`),
-/// 2 the chain only (`verify-ca`). `root_cert` is the path of a PEM file
+/// 2 the chain only (`verify-ca`). Any other value is `verify-full`. `root_cert` is the path of a PEM file
 /// with the CA certificates to trust (`sslrootcert`), or empty for the
 /// Mozilla and system roots.
 ///
@@ -675,12 +701,11 @@ pub unsafe extern "C" fn dpg_connect(
     err: *mut u8,
     err_cap: i64,
 ) -> i64 {
-    let cfg = unsafe { std::slice::from_raw_parts(cfg, len as usize) };
-    let root_cert = if root_len > 0 {
-        unsafe { std::slice::from_raw_parts(root_cert, root_len as usize) }
-    } else {
-        &[]
-    };
+    if len < 0 || root_len < 0 {
+        return -1;
+    }
+    let cfg = unsafe { bytes(cfg, len) };
+    let root_cert = unsafe { bytes(root_cert, root_len) };
     let (Ok(text), Ok(root_cert)) = (std::str::from_utf8(cfg), std::str::from_utf8(root_cert))
     else {
         return -1;
@@ -689,11 +714,7 @@ pub unsafe extern "C" fn dpg_connect(
         return -1;
     };
     let max_size = max_size.max(1) as usize;
-    let check = match verify {
-        1 => Check::Full,
-        2 => Check::Chain,
-        _ => Check::None,
-    };
+    let check = Check::of(verify);
     // sslmode is in `cfg`, so the key has all the TLS settings
     let key = format!("{max_size} {check:?} {root_cert:?} {text}");
     pools(|r| {
@@ -858,6 +879,37 @@ mod tests {
             ),
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn an_unknown_verify_value_is_the_full_check() {
+        assert_eq!(Check::of(0), Check::None);
+        assert_eq!(Check::of(1), Check::Full);
+        assert_eq!(Check::of(2), Check::Chain);
+        assert_eq!(Check::of(-1), Check::Full);
+        assert_eq!(Check::of(7), Check::Full);
+    }
+
+    #[test]
+    fn negative_ffi_lengths_are_refused() {
+        let cfg = b"host=127.0.0.1 port=1 user=u dbname=neg_test";
+        let open = |len, root_len| unsafe {
+            dpg_connect(
+                cfg.as_ptr(),
+                len,
+                1,
+                0,
+                cfg.as_ptr(),
+                root_len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        assert_eq!(open(-1, 0), -1);
+        assert_eq!(open(cfg.len() as i64, -5), -1);
+        assert!(unsafe { bytes(cfg.as_ptr(), -1) }.is_empty());
+        assert!(unsafe { bytes(std::ptr::null(), 4) }.is_empty());
+        assert_eq!(unsafe { bytes(cfg.as_ptr(), 4) }, b"host");
     }
 
     #[test]
