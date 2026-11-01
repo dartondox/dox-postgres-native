@@ -21,7 +21,10 @@ To see what is ready and what may still change, read [Status and roadmap](https:
 
 ## How it works
 
-- Rust ([tokio-postgres](https://docs.rs/tokio-postgres)) owns the connections and the pool.
+- Rust owns the connections and the pool.
+- The Postgres work of each isolate runs on the thread of that isolate. There is no extra runtime thread, and no thread hop per query.
+- Queries are pipelined: many queries go out on one connection without waiting for each answer.
+- Isolates that open the same settings share one pool. `maxConnections` is the limit for the whole process. An idle connection moves to an isolate that waits for one.
 - Your models and queries stay in Dart. You do not change any config.
 - It does not use the Dart `postgres` package. It has its own `@name` parser and value encoder.
 - Server errors are `PgServerException`, other errors are `PgException`.
@@ -123,7 +126,7 @@ PgNativePool pool = PgNativePool.open(
 
 ## Features
 
-- Many queries go to Rust in one call. Many results come back in one message.
+- Many queries go to Rust in one call. Many results come back in one call.
 - Each connection keeps its prepared statements.
 - Transactions: `pool.begin()`, `pool.commit(tx)`, `pool.rollback(tx)`.
 - Parameters as a map for `@name`, or a list for `$1, $2`.

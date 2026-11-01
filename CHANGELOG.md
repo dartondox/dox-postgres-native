@@ -1,3 +1,15 @@
+## Unreleased
+
+- Faster. All Postgres work now runs on the thread of the Dart isolate, with mio, like `dox_http_native`. There is no tokio thread any more, so no thread hop per query. Queries are written to the socket when Dart sends them, and read when Dart asks for the results. In the prototype, `GET /db` on 2 cores went from 127k to 258k requests per second (Bun: 188k).
+- No more tokio, tokio-postgres, deadpool-postgres, tokio-postgres-rustls and futures-util. The driver speaks the Postgres protocol itself, with `postgres-protocol` for the messages and the login (trust, cleartext, md5, SCRAM-SHA-256). Connect and login do not block the isolate. TLS is still rustls, with the same `sslMode` and `sslRootCert` rules.
+- `maxConnections` is still the limit for the whole process. When one isolate waits for a connection, the other isolates give their idle ones to the pool. No isolate waits forever while another keeps connections it does not use.
+- A dead isolate (eg. killed, or an uncaught error) now closes its connections within about 100 ms. An open transaction of it is rolled back by the server.
+- The `threads` option of `PgNativePool.open` and `fromUrl` does nothing now. It stays so code that sets it still works.
+- A transaction id still works in any isolate. Its requests go to the isolate that started it, and the answers come back.
+- Less memory. A connection reads a chunk, then its messages, then the next chunk, so its read buffer stays small (64 KiB) also when many answers come at once. Read and write buffers that grew over 256 KiB are freed once empty. Row buffers are reused.
+- The host name is looked up when the pool opens, and again on a background thread after a connect fails (eg. after a database failover moves the name to another IP). The isolate never waits for DNS.
+- The native ABI version is now 6 (`dpg_connect` has no `threads`; `dpg_open`, `dpg_submit` and `dpg_run` work on the link of one isolate; the leaf calls never call the Dart API).
+
 ## 3.0.0
 
 - The first stable release.

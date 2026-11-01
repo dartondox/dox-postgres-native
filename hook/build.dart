@@ -182,7 +182,9 @@ Future<Uri?> _cargo(
     return null; // no cargo
   }
   output.dependencies.add(native.resolve('Cargo.toml'));
-  output.dependencies.add(native.resolve('src/lib.rs'));
+  for (String file in <String>['lib.rs', 'conn.rs', 'link.rs']) {
+    output.dependencies.add(native.resolve('src/$file'));
+  }
   Uri lib = target.resolve('release/$fileName');
   return File.fromUri(lib).existsSync() ? lib : null;
 }

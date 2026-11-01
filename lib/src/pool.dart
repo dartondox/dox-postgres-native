@@ -22,7 +22,8 @@ class PgNativeResult {
   final List<Map<String, dynamic>> rows;
 }
 
-/// A pool of Postgres connections, owned by Rust.
+/// A pool of Postgres connections, owned by Rust. The Postgres work of
+/// each isolate runs on its own thread, with no extra runtime thread.
 ///
 /// ```
 /// PgNativePool pool = PgNativePool.open(
@@ -99,9 +100,8 @@ class PgNativePool {
   /// A [host] that starts with `/` is a Unix socket folder, like libpq.
   /// Eg. `/cloudsql/project:region:instance` on Google Cloud Run.
   ///
-  /// [threads] is the size of the Rust runtime of the whole process. Only
-  /// the first pool sets it. 0 runs one `current_thread` runtime on its own
-  /// thread.
+  /// [threads] is not used any more: each isolate runs its Postgres work
+  /// on its own thread. It stays so code that sets it still works.
   ///
   /// [sslMode] is like libpq: `disable` (no TLS), `prefer` (TLS when the
   /// server has it), `require` (TLS, no certificate check), `verify-ca`
@@ -128,8 +128,8 @@ class PgNativePool {
     String sslMode = 'disable',
     String? sslRootCert,
   }) {
-    // tokio-postgres knows disable, prefer and require. verify-ca and
-    // verify-full are require with the certificate check on.
+    // Rust knows disable, prefer and require. verify-ca and verify-full
+    // are require with the certificate check on.
     String? mode = const <String, String>{
       'disable': 'disable',
       'prefer': 'prefer',
@@ -170,7 +170,6 @@ class PgNativePool {
       bytes.address,
       bytes.length,
       maxConnections,
-      threads,
       const <String, int>{'verify-full': 1, 'verify-ca': 2}[sslMode] ?? 0,
       rootCert.address,
       rootCert.length,
@@ -282,19 +281,27 @@ class PgNativePool {
   }
 }
 
-/// The link of this isolate to Rust: one sink for the results, and one
-/// buffer for the requests that go out in the next microtask.
+/// The link of this isolate to Rust: one link in Rust (its sockets), and
+/// one buffer for the requests that go out in the next microtask.
 class _Link {
   _Link._() {
-    _port = RawReceivePort(_onBatch, 'dox_postgres_native');
+    _port = RawReceivePort(_onMessage, 'dox_postgres_native');
     _port.keepIsolateAlive = false;
-    _sink = dpgOpen(_port.sendPort.nativePort);
+    _link = dpgOpen(_port.sendPort.nativePort);
+    if (_link == 0) {
+      throw StateError('dox_postgres_native: can not open the native link');
+    }
   }
 
   static final _Link instance = _Link._();
 
   late final RawReceivePort _port;
-  late final int _sink;
+
+  /// the link in Rust
+  late final int _link;
+
+  /// the results, written by Rust
+  Uint8List _in = Uint8List(1 << 16);
 
   /// The waiting requests. The id of a request is its slot here. Rust
   /// answers each id once, so a slot is free again after its answer.
@@ -482,7 +489,8 @@ class _Link {
   void _flush() {
     _flushQueued = false;
     if (_len == 0) return;
-    dpgSubmit(_sink, _out.address, _len);
+    // some results are ready at once (eg. an error): read them soon
+    if (dpgSubmit(_link, _out.address, _len) != 0) scheduleMicrotask(_run);
     _len = 0;
     if (_out.length > 1 << 20) {
       _out = Uint8List(1 << 14); // do not keep a big buffer forever
@@ -492,8 +500,30 @@ class _Link {
 
   // ---- results from Rust ----
 
-  void _onBatch(Object? message) {
-    Uint8List b = message as Uint8List;
+  /// From Rust: `[1]` when there are results to read, empty to check
+  /// that the isolate is alive.
+  void _onMessage(Object? message) {
+    if ((message as Uint8List).isNotEmpty) _run();
+  }
+
+  /// Reads the results that are there. Never waits.
+  void _run() {
+    int n = dpgRun(_link, _in.address, _in.length);
+    // -n: the results need n bytes. Rust keeps them for the next call.
+    while (n < 0) {
+      int size = _in.length * 2;
+      while (size < -n) {
+        size *= 2;
+      }
+      _in = Uint8List(size);
+      n = dpgRun(_link, _in.address, _in.length);
+    }
+    // a view, no copy: _onBatch reads all it needs before it returns
+    if (n > 0) _onBatch(Uint8List.sublistView(_in, 0, n));
+    if (_in.length > 1 << 20) _in = Uint8List(1 << 16);
+  }
+
+  void _onBatch(Uint8List b) {
     ByteData d = ByteData.sublistView(b);
     int p = 0;
     while (p + 13 <= b.length) {
