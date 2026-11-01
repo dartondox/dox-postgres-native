@@ -1,3 +1,8 @@
+## Unreleased
+
+- Fix: when the server ended a connection, its last error and the close could come in one read. The driver then missed the close, and the query on it waited for the 300 s timeout. It now reads on to the end when the server closes.
+
+
 ## 3.0.1
 
 - Faster. All Postgres work now runs on the thread of the Dart isolate, with mio, like `dox_http_native`. There is no tokio thread any more, so no thread hop per query. Queries are written to the socket when Dart sends them, and read when Dart asks for the results. `GET /db` on 2 cores went from 149k to 261k requests per second (Bun: 193k).
