@@ -10,7 +10,8 @@
 //!   waits.
 //! - A small idle helper thread per link watches the sockets while Dart is
 //!   idle. It posts `[1]` to the Dart port when there is something to read.
-//!   It also checks that the isolate is alive.
+//!   It also checks that the isolate is alive. Only the helper calls the
+//!   Dart API: `dpg_submit` and `dpg_run` are leaf calls, which must not.
 //!
 //! One connection (see `conn.rs`) speaks the Postgres protocol by itself:
 //! connect, TLS (rustls), login, and queries. Plain queries are pipelined:
@@ -411,8 +412,8 @@ struct PoolState {
     /// connections no link uses. They are not in any poll.
     idle: Vec<Conn>,
     /// links that wait for a connection, first come first: (link id,
-    /// Dart port)
-    waiting: VecDeque<(u64, i64)>,
+    /// link)
+    waiting: VecDeque<(u64, std::sync::Weak<link::Link>)>,
     /// the addresses, looked up when the pool opens
     addrs: Result<Vec<Addr>, Fail>,
     /// a new lookup runs on a thread
@@ -431,10 +432,13 @@ impl Pool {
         Self::wake(&st);
     }
 
-    /// Tells the links that wait to try again.
+    /// Tells the links that wait to try again (through their helpers:
+    /// this may run in a leaf call, so no Dart API here).
     fn wake(st: &PoolState) {
-        for (_, port) in &st.waiting {
-            post(*port, &[1]);
+        for (_, link) in &st.waiting {
+            if let Some(link) = link.upgrade() {
+                link.nudge();
+            }
         }
     }
 

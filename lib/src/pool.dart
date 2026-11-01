@@ -489,7 +489,8 @@ class _Link {
   void _flush() {
     _flushQueued = false;
     if (_len == 0) return;
-    dpgSubmit(_link, _out.address, _len);
+    // some results are ready at once (eg. an error): read them soon
+    if (dpgSubmit(_link, _out.address, _len) != 0) scheduleMicrotask(_run);
     _len = 0;
     if (_out.length > 1 << 20) {
       _out = Uint8List(1 << 14); // do not keep a big buffer forever

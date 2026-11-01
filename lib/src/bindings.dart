@@ -43,11 +43,13 @@ external void dpgClose(int pool);
 external int dpgOpen(int sendPort);
 
 /// Sends a batch of request records. They are written to the sockets now.
-@Native<Void Function(Int64, Pointer<Uint8>, Int64)>(
+/// Returns 1 when some results are ready at once: call [dpgRun] soon.
+/// Leaf calls never post to a port; only the helper thread of Rust does.
+@Native<Int64 Function(Int64, Pointer<Uint8>, Int64)>(
   symbol: 'dpg_submit',
   isLeaf: true,
 )
-external void dpgSubmit(int link, Pointer<Uint8> data, int length);
+external int dpgSubmit(int link, Pointer<Uint8> data, int length);
 
 /// Reads the answers that are there into [buffer]. Never waits.
 @Native<Int64 Function(Int64, Pointer<Uint8>, Int64)>(
