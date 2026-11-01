@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:ffi';
+import 'dart:io';
 import 'dart:isolate';
 import 'dart:typed_data';
 
@@ -286,10 +287,26 @@ class PgNativePool {
 /// buffer for the requests that go out in the next microtask.
 class _Link {
   _Link._() {
-    _port = RawReceivePort(_onBatch, 'dox_postgres_native');
+    _port = RawReceivePort(_onMessage, 'dox_postgres_native');
     _port.keepIsolateAlive = false;
     _sink = dpgOpen(_port.sendPort.nativePort);
+    if (_directOn) _direct = dpgDirectOpen(_port.sendPort.nativePort);
   }
+
+  /// Direct mode (a prototype, see native/src/direct.rs): plain queries
+  /// run on the thread of this isolate, not on the tokio thread.
+  static final bool _directOn = Platform.environment['DOX_PG_DIRECT'] == '1';
+
+  /// Direct mode only: after each submit, one more run in the next event
+  /// loop turn, to pick up answers that are already there without the
+  /// wake of the idle helper.
+  static final bool _pumpOn = Platform.environment['DOX_PG_DIRECT_PUMP'] == '1';
+
+  /// the direct link in Rust, or 0: the tokio path only
+  int _direct = 0;
+
+  /// the results of direct mode, written by Rust
+  Uint8List _in = Uint8List(1 << 16);
 
   static final _Link instance = _Link._();
 
@@ -482,7 +499,12 @@ class _Link {
   void _flush() {
     _flushQueued = false;
     if (_len == 0) return;
-    dpgSubmit(_sink, _out.address, _len);
+    if (_direct != 0) {
+      dpgDirectSubmit(_direct, _sink, _out.address, _len);
+      if (_pumpOn) Timer.run(_run);
+    } else {
+      dpgSubmit(_sink, _out.address, _len);
+    }
     _len = 0;
     if (_out.length > 1 << 20) {
       _out = Uint8List(1 << 14); // do not keep a big buffer forever
@@ -492,8 +514,31 @@ class _Link {
 
   // ---- results from Rust ----
 
-  void _onBatch(Object? message) {
+  /// A batch of results from the tokio path, or from the idle helper of
+  /// direct mode: `[1]` to run, empty to check that the isolate is alive.
+  void _onMessage(Object? message) {
     Uint8List b = message as Uint8List;
+    if (b.length >= 13) return _onBatch(b);
+    if (b.isNotEmpty) _run();
+  }
+
+  /// Direct mode: reads the results that are there. Never waits.
+  void _run() {
+    int n = dpgDirectRun(_direct, _in.address, _in.length);
+    if (n < 0) {
+      int size = _in.length * 2;
+      while (size < -n) {
+        size *= 2;
+      }
+      _in = Uint8List(size);
+      n = dpgDirectRun(_direct, _in.address, _in.length);
+    }
+    // a view, no copy: _onBatch reads all it needs before it returns
+    if (n > 0) _onBatch(Uint8List.sublistView(_in, 0, n));
+    if (_in.length > 1 << 20) _in = Uint8List(1 << 16);
+  }
+
+  void _onBatch(Uint8List b) {
     ByteData d = ByteData.sublistView(b);
     int p = 0;
     while (p + 13 <= b.length) {

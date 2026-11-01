@@ -24,6 +24,9 @@
 //! - status 2 (other error): the message.
 //! - status 3 (transaction started): u64 transaction id.
 //!
+//! Direct mode (`direct.rs`, a prototype): plain queries run on the thread
+//! of the Dart isolate, without the tokio thread.
+//!
 //! TLS is rustls. `sslmode` in the config turns it on (`prefer` or
 //! `require`); `dpg_connect` says how the certificate is checked, and which
 //! CA file to trust.
@@ -48,8 +51,11 @@ use tokio_postgres::types::{FromSql, IsNull, Kind, ToSql, Type, to_sql_checked};
 use tokio_postgres::{Row, Statement};
 use tokio_postgres_rustls::MakeRustlsConnect;
 
+#[cfg(unix)]
+mod direct;
+
 /// Bump when the FFI functions or the record layout change.
-const ABI_VERSION: i32 = 4;
+const ABI_VERSION: i32 = 5;
 const REQ_HEAD: usize = 32;
 const RES_HEAD: usize = 13;
 /// Statements kept per connection. Over this, the one used longest ago is
@@ -213,6 +219,8 @@ struct Shared {
     key: String,
     /// how many opens use this pool. The last close closes it.
     refs: AtomicUsize,
+    /// the config, for the connections of direct mode
+    pg: tokio_postgres::Config,
 }
 
 impl Shared {
@@ -1097,7 +1105,7 @@ pub unsafe extern "C" fn dpg_connect(
             }
         };
         let manager = Manager::from_config(
-            pg,
+            pg.clone(),
             tls,
             ManagerConfig {
                 recycling_method: RecyclingMethod::Fast,
@@ -1111,6 +1119,7 @@ pub unsafe extern "C" fn dpg_connect(
             busy: Mutex::new(Vec::new()),
             key,
             refs: AtomicUsize::new(1),
+            pg,
         })) as i64
     })
 }
@@ -1170,6 +1179,14 @@ pub unsafe extern "C" fn dpg_submit(sink: i64, ptr: *const u8, len: i64) {
     if !plain.is_empty() {
         run_plain(plain, sink, rt);
     }
+}
+
+/// Direct mode needs a poll file (epoll or kqueue): not on Windows. 0
+/// tells Dart to use the tokio path.
+#[cfg(not(unix))]
+#[unsafe(no_mangle)]
+pub extern "C" fn dpg_direct_open(_send_port: i64) -> i64 {
+    0
 }
 
 #[cfg(test)]

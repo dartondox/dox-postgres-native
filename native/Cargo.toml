@@ -11,6 +11,9 @@ crate-type = ["cdylib"]
 bytes = "1.12.1"
 deadpool-postgres = "0.14.2"
 futures-util = { version = "0.3.34", default-features = false, features = ["alloc"] }
+libc = "0.2.191"
+mio = { version = "1.2.4", features = ["os-poll", "net"] }
+postgres-protocol = "0.6.12"
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-native-certs = "0.8.5"
 tokio = { version = "1.54.1", features = ["rt", "rt-multi-thread", "sync", "time"] }

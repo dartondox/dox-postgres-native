@@ -4,7 +4,7 @@ import 'dart:ffi';
 /// the library as the code asset of this file.
 
 /// The ABI version the Dart side expects. Must match `ABI_VERSION` in Rust.
-const int abiVersion = 4;
+const int abiVersion = 5;
 
 @Native<Int32 Function()>(symbol: 'dpg_version', isLeaf: true)
 external int dpgVersion();
@@ -51,3 +51,25 @@ external void dpgRelease(int sink);
   isLeaf: true,
 )
 external void dpgSubmit(int sink, Pointer<Uint8> data, int length);
+
+// ---- direct mode (a prototype, see native/src/direct.rs) ----
+
+@Native<Int64 Function(Int64)>(symbol: 'dpg_direct_open', isLeaf: true)
+external int dpgDirectOpen(int sendPort);
+
+@Native<Void Function(Int64, Int64, Pointer<Uint8>, Int64)>(
+  symbol: 'dpg_direct_submit',
+  isLeaf: true,
+)
+external void dpgDirectSubmit(
+  int link,
+  int sink,
+  Pointer<Uint8> data,
+  int length,
+);
+
+@Native<Int64 Function(Int64, Pointer<Uint8>, Int64)>(
+  symbol: 'dpg_direct_run',
+  isLeaf: true,
+)
+external int dpgDirectRun(int link, Pointer<Uint8> buffer, int capacity);
