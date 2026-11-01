@@ -3,7 +3,7 @@ import 'dart:io';
 import 'package:dox_postgres_native/dox_postgres_native.dart';
 import 'package:test/test.dart';
 
-// Direct mode only: DOX_PG_DIRECT=1 DB_PORT=5452 dart test
+// Postgres like in CI. DB_PORT=5472 dart test, for another port.
 String host = Platform.environment['DB_HOST'] ?? 'localhost';
 int port = int.parse(Platform.environment['DB_PORT'] ?? '5432');
 
@@ -62,8 +62,43 @@ void main() {
       }
       pool.close();
     },
-    skip: Platform.environment['DOX_PG_DIRECT'] == '1'
-        ? false
-        : 'needs DOX_PG_DIRECT=1',
+  );
+
+  test(
+    'a connection the server ends fails its query, the next works',
+    () async {
+      PgNativePool pool = PgNativePool.open(
+        host: host,
+        port: port,
+        user: 'postgres',
+        password: 'postgres',
+        database: 'postgres',
+        maxConnections: 1,
+        applicationName: 'dpg_killed',
+      );
+      PgNativePool admin = PgNativePool.open(
+        host: host,
+        port: port,
+        user: 'postgres',
+        password: 'postgres',
+        database: 'postgres',
+        maxConnections: 1,
+      );
+      Future<Object?> slow = pool
+          .query('SELECT pg_sleep(5)')
+          .then<Object?>((_) => 'ok', onError: (Object e) => e);
+      await Future<void>.delayed(const Duration(milliseconds: 300));
+      await admin.query(
+        'SELECT pg_terminate_backend(pid) FROM pg_stat_activity '
+        "WHERE application_name = 'dpg_killed'",
+      );
+      Object? e = await slow.timeout(const Duration(seconds: 3));
+      expect(e, isA<PgServerException>());
+      expect((e as PgServerException).code, '57P01');
+      // a new connection opens for the next query
+      expect((await pool.query('SELECT 1 AS n')).rows.single['n'], 1);
+      pool.close();
+      admin.close();
+    },
   );
 }
