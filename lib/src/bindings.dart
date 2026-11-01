@@ -4,7 +4,7 @@ import 'dart:ffi';
 /// the library as the code asset of this file.
 
 /// The ABI version the Dart side expects. Must match `ABI_VERSION` in Rust.
-const int abiVersion = 5;
+const int abiVersion = 6;
 
 @Native<Int32 Function()>(symbol: 'dpg_version', isLeaf: true)
 external int dpgVersion();
@@ -18,7 +18,6 @@ external int dpgInit(Pointer<Void> dlData);
     Int64,
     Int64,
     Int64,
-    Int64,
     Pointer<Uint8>,
     Int64,
     Pointer<Uint8>,
@@ -29,7 +28,6 @@ external int dpgConnect(
   Pointer<Uint8> cfg,
   int length,
   int maxSize,
-  int threads,
   int verify,
   Pointer<Uint8> rootCert,
   int rootLength,
@@ -40,36 +38,24 @@ external int dpgConnect(
 @Native<Void Function(Int64)>(symbol: 'dpg_close')
 external void dpgClose(int pool);
 
+/// Opens the link of this isolate. Its idle helper posts to [sendPort].
 @Native<Int64 Function(Int64)>(symbol: 'dpg_open', isLeaf: true)
 external int dpgOpen(int sendPort);
 
-@Native<Void Function(Int64)>(symbol: 'dpg_release', isLeaf: true)
-external void dpgRelease(int sink);
-
+/// Sends a batch of request records. They are written to the sockets now.
 @Native<Void Function(Int64, Pointer<Uint8>, Int64)>(
   symbol: 'dpg_submit',
   isLeaf: true,
 )
-external void dpgSubmit(int sink, Pointer<Uint8> data, int length);
+external void dpgSubmit(int link, Pointer<Uint8> data, int length);
 
-// ---- direct mode (a prototype, see native/src/direct.rs) ----
-
-@Native<Int64 Function(Int64)>(symbol: 'dpg_direct_open', isLeaf: true)
-external int dpgDirectOpen(int sendPort);
-
-@Native<Void Function(Int64, Int64, Pointer<Uint8>, Int64)>(
-  symbol: 'dpg_direct_submit',
-  isLeaf: true,
-)
-external void dpgDirectSubmit(
-  int link,
-  int sink,
-  Pointer<Uint8> data,
-  int length,
-);
-
+/// Reads the answers that are there into [buffer]. Never waits.
 @Native<Int64 Function(Int64, Pointer<Uint8>, Int64)>(
-  symbol: 'dpg_direct_run',
+  symbol: 'dpg_run',
   isLeaf: true,
 )
-external int dpgDirectRun(int link, Pointer<Uint8> buffer, int capacity);
+external int dpgRun(int link, Pointer<Uint8> buffer, int capacity);
+
+/// For tests: the request and transaction timeout of a pool, in ms.
+@Native<Void Function(Int64, Int64)>(symbol: 'dpg_set_timeout', isLeaf: true)
+external void dpgSetTimeout(int pool, int ms);
