@@ -509,7 +509,8 @@ class _Link {
   /// Reads the results that are there. Never waits.
   void _run() {
     int n = dpgRun(_link, _in.address, _in.length);
-    if (n < 0) {
+    // -n: the results need n bytes. Rust keeps them for the next call.
+    while (n < 0) {
       int size = _in.length * 2;
       while (size < -n) {
         size *= 2;

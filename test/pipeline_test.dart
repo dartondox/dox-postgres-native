@@ -101,4 +101,30 @@ void main() {
       admin.close();
     },
   );
+
+  test('results bigger than the Dart buffer, many times over', () async {
+    // Results did not fit Dart's buffer; the call that came after with a
+    // bigger buffer found even more, and they were lost (a hang).
+    PgNativePool pool = PgNativePool.open(
+      host: host,
+      port: port,
+      user: 'postgres',
+      password: 'postgres',
+      database: 'postgres',
+      maxConnections: 4,
+    );
+    await pool.query('SELECT 1');
+    for (int round = 0; round < 5; round++) {
+      List<PgNativeResult> all = await Future.wait(<Future<PgNativeResult>>[
+        for (int i = 0; i < 200; i++)
+          pool.query(
+            r"SELECT g, repeat('x', 100) AS t FROM generate_series(1, 50) g "
+            r'WHERE $1::int >= 0',
+            parameters: <int>[i],
+          ),
+      ]).timeout(const Duration(seconds: 10));
+      expect(all.every((PgNativeResult r) => r.rows.length == 50), isTrue);
+    }
+    pool.close();
+  });
 }

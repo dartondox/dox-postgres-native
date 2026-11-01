@@ -165,6 +165,9 @@ struct Core {
     pools: HashMap<u64, Local>,
     /// result records not given to Dart yet
     ready: Vec<u8>,
+    /// `ready` did not fit Dart's buffer: the next `dpg_run` only copies
+    /// it, so it does not grow more in between
+    held: bool,
     /// the next timer
     due: Option<Instant>,
     /// the next transaction number. A transaction id is (link id << 32) |
@@ -271,6 +274,7 @@ impl Core {
             conns: Vec::new(),
             pools: HashMap::new(),
             ready: Vec::new(),
+            held: false,
             due: None,
             next_tx: 1,
             foreign: HashMap::new(),
@@ -1041,19 +1045,25 @@ pub unsafe extern "C" fn dpg_run(link: i64, buf: *mut u8, cap: i64) -> i64 {
     let mut core = s.core.lock().unwrap();
     let Some(c) = core.as_mut() else { return 0 };
     s.armed.store(false, Ordering::Release);
-    let inbox = if s.has_in.swap(false, Ordering::AcqRel) {
-        std::mem::take(&mut *s.inbox.lock().unwrap())
-    } else {
-        Vec::new()
-    };
-    c.run(inbox);
-    if s.has_out.swap(false, Ordering::AcqRel) {
-        c.ready.append(&mut s.outbox.lock().unwrap());
+    if !c.held {
+        let inbox = if s.has_in.swap(false, Ordering::AcqRel) {
+            std::mem::take(&mut *s.inbox.lock().unwrap())
+        } else {
+            Vec::new()
+        };
+        c.run(inbox);
+        if s.has_out.swap(false, Ordering::AcqRel) {
+            let out = std::mem::take(&mut *s.outbox.lock().unwrap());
+            c.ready.extend_from_slice(&out);
+        }
     }
     let n = c.ready.len();
     if n > cap.max(0) as usize {
+        // Dart calls again at once with a buffer this big
+        c.held = true;
         return -(n as i64);
     }
+    c.held = false;
     unsafe { std::ptr::copy_nonoverlapping(c.ready.as_ptr(), buf, n) };
     c.ready.clear();
     if c.ready.capacity() > BIG_BUF {
