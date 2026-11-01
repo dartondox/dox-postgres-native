@@ -1,7 +1,7 @@
-## Unreleased
+## 3.0.2
 
 - Fix: when the server ended a connection, its last error and the close could come in one read. The driver then missed the close, and the query on it waited for the 300 s timeout. It now reads on to the end when the server closes.
-
+- CI: the tests also run on a release tag. A red test stops the release.
 
 ## 3.0.1
 
