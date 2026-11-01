@@ -639,8 +639,10 @@ impl Core {
             let Some(c) = self.conns.get_mut(i).and_then(Option::as_mut) else {
                 continue;
             };
-            let readable = ev.is_readable() || ev.is_read_closed() || ev.is_error();
-            if let Err(f) = c.event(self.poll.registry(), Token(i), readable, &mut self.ready) {
+            let closed = ev.is_read_closed() || ev.is_error();
+            let readable = ev.is_readable() || closed;
+            let ready = &mut self.ready;
+            if let Err(f) = c.event(self.poll.registry(), Token(i), readable, closed, ready) {
                 broken.push((i, f));
             }
         }

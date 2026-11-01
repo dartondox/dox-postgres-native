@@ -721,6 +721,7 @@ impl Conn {
         reg: &Registry,
         token: Token,
         readable: bool,
+        closed: bool,
         ready: &mut Vec<u8>,
     ) -> Result<(), Fail> {
         if matches!(self.state, State::Connecting) {
@@ -728,7 +729,7 @@ impl Conn {
                 return Ok(());
             }
         } else if readable {
-            self.read(ready)?;
+            self.read(ready, closed)?;
         }
         if self.need_write() || self.writable {
             self.flush(reg, token)?;
@@ -841,8 +842,10 @@ impl Conn {
     }
 
     /// Reads one chunk into `inb`: (the server closed the connection, the
-    /// socket may have more).
-    fn fill(&mut self) -> Result<(bool, bool), Fail> {
+    /// socket may have more). `closed`: the event says the server closed
+    /// or the socket failed. Then a short read is not the end: the close
+    /// came with the data and brings no new event, so read on to see it.
+    fn fill(&mut self, closed: bool) -> Result<(bool, bool), Fail> {
         let Conn {
             sock,
             tls,
@@ -862,8 +865,8 @@ impl Conn {
                         *filled += n;
                         // A short read took all there was. More data later
                         // is a new edge (a new event), so no read just to
-                        // see WouldBlock.
-                        return Ok((false, n == room));
+                        // see WouldBlock. Unless the server closed.
+                        return Ok((false, n == room || closed));
                     }
                     Err(e) if e.kind() == ErrorKind::WouldBlock => return Ok((false, false)),
                     Err(e) if e.kind() == ErrorKind::Interrupted => {}
@@ -918,9 +921,9 @@ impl Conn {
     /// It reads a chunk, then reads its messages, until the socket has no
     /// more. So the read buffer stays small, also when the server sends
     /// many answers at once.
-    pub fn read(&mut self, ready: &mut Vec<u8>) -> Result<(), Fail> {
+    pub fn read(&mut self, ready: &mut Vec<u8>, closed: bool) -> Result<(), Fail> {
         loop {
-            let (eof, more) = self.fill()?;
+            let (eof, more) = self.fill(closed)?;
             if matches!(self.state, State::SslReq) && self.filled > 0 {
                 self.ssl_answer()?;
             }
@@ -938,7 +941,7 @@ impl Conn {
     /// still works.
     pub fn alive(&mut self) -> bool {
         let mut none = Vec::new();
-        self.read(&mut none).is_ok()
+        self.read(&mut none, true).is_ok()
     }
 
     /// Reads the whole messages in `inb`.
