@@ -47,8 +47,16 @@ use crate::{
 
 /// Smallest free room in a read buffer before a read.
 const READ_ROOM: usize = 16 * 1024;
-/// An empty read buffer bigger than this is made small again.
-const BIG_BUF: usize = 1 << 20;
+/// An empty read or write buffer bigger than this is freed. Reads are
+/// parsed chunk by chunk, so the read buffer only grows past its first
+/// size for one big message.
+const BIG_BUF: usize = 256 * 1024;
+/// The first size of the write buffer.
+const OUT_SIZE: usize = 16 * 1024;
+/// Row buffers kept per connection for the next queries, and the biggest
+/// one kept. Less malloc and free per query.
+const SPARE_MAX: usize = 32;
+const SPARE_SIZE: usize = 16 * 1024;
 /// Error codes after which a query is sent once more, with a new Parse:
 /// the statement is gone (eg. its Parse failed) or its plan is out of date
 /// (eg. after ALTER TABLE).
@@ -359,6 +367,8 @@ pub(crate) struct Conn {
     tick: u64,
     names: u64,
     waits: VecDeque<Wait>,
+    /// empty row buffers for the next queries
+    spare: Vec<Vec<u8>>,
     /// requests placed before the login is done
     pre: Vec<Pending>,
     /// the transaction that owns this connection
@@ -391,7 +401,7 @@ impl Conn {
                         state: State::Connecting,
                         next_addr: i + 1,
                         addrs,
-                        out: BytesMut::with_capacity(16 * 1024),
+                        out: BytesMut::with_capacity(OUT_SIZE),
                         writable: true,
                         inb: Vec::new(),
                         filled: 0,
@@ -399,6 +409,7 @@ impl Conn {
                         tick: 0,
                         names: 0,
                         waits: VecDeque::new(),
+                        spare: Vec::new(),
                         pre: Vec::new(),
                         tx: None,
                         last: now,
@@ -550,6 +561,7 @@ impl Conn {
             stmts,
             out,
             waits,
+            spare,
             names,
             tick,
             ..
@@ -638,7 +650,7 @@ impl Conn {
             },
             at,
             cols: None,
-            rows: Vec::new(),
+            rows: spare.pop().unwrap_or_default(),
             count: 0,
             fail: None,
             retry: false,
@@ -657,6 +669,9 @@ impl Conn {
         let blocked = match tls {
             None => loop {
                 if out.is_empty() {
+                    if out.capacity() > BIG_BUF {
+                        *out = BytesMut::with_capacity(OUT_SIZE);
+                    }
                     break false;
                 }
                 match sock.write(out) {
@@ -672,6 +687,9 @@ impl Conn {
                     // no buffer limit: this takes all of it
                     tls.writer().write_all(out).map_err(write_error)?;
                     out.clear();
+                    if out.capacity() > BIG_BUF {
+                        *out = BytesMut::with_capacity(OUT_SIZE);
+                    }
                 }
                 loop {
                     if !tls.wants_write() {
@@ -822,9 +840,9 @@ impl Conn {
         }
     }
 
-    /// Reads what the socket has into `inb`. Ok(true): the server closed
-    /// the connection.
-    fn fill(&mut self) -> Result<bool, Fail> {
+    /// Reads one chunk into `inb`: (the server closed the connection, the
+    /// socket may have more).
+    fn fill(&mut self) -> Result<(bool, bool), Fail> {
         let Conn {
             sock,
             tls,
@@ -835,21 +853,19 @@ impl Conn {
         let read_error =
             |e: std::io::Error| Fail::text(&format!("error communicating with the server: {e}"));
         let Some(tls) = tls else {
+            Self::room(inb, *filled);
+            let room = inb.len() - *filled;
             loop {
-                Self::room(inb, *filled);
-                let room = inb.len() - *filled;
                 match sock.read(&mut inb[*filled..]) {
-                    Ok(0) => return Ok(true),
+                    Ok(0) => return Ok((true, false)),
                     Ok(n) => {
                         *filled += n;
                         // A short read took all there was. More data later
                         // is a new edge (a new event), so no read just to
                         // see WouldBlock.
-                        if n < room {
-                            return Ok(false);
-                        }
+                        return Ok((false, n == room));
                     }
-                    Err(e) if e.kind() == ErrorKind::WouldBlock => return Ok(false),
+                    Err(e) if e.kind() == ErrorKind::WouldBlock => return Ok((false, false)),
                     Err(e) if e.kind() == ErrorKind::Interrupted => {}
                     Err(e) => return Err(read_error(e)),
                 }
@@ -892,24 +908,30 @@ impl Conn {
                     Err(e) => return Err(read_error(e)),
                 }
             }
-            if !got || eof {
-                return Ok(eof);
-            }
+            return Ok((eof, got && !eof));
         }
     }
 
     /// Reads what the socket has, and adds the result records of the
     /// requests that are done to `ready`. Err: the connection is broken.
+    ///
+    /// It reads a chunk, then reads its messages, until the socket has no
+    /// more. So the read buffer stays small, also when the server sends
+    /// many answers at once.
     pub fn read(&mut self, ready: &mut Vec<u8>) -> Result<(), Fail> {
-        let eof = self.fill()?;
-        if matches!(self.state, State::SslReq) && self.filled > 0 {
-            self.ssl_answer()?;
+        loop {
+            let (eof, more) = self.fill()?;
+            if matches!(self.state, State::SslReq) && self.filled > 0 {
+                self.ssl_answer()?;
+            }
+            self.messages(ready)?;
+            if eof {
+                return Err(Fail::text("connection closed"));
+            }
+            if !more {
+                return Ok(());
+            }
         }
-        self.messages(ready)?;
-        if eof {
-            return Err(Fail::text("connection closed"));
-        }
-        Ok(())
     }
 
     /// A connection that waited in the idle list of the pool: true when it
@@ -1023,6 +1045,7 @@ impl Conn {
             filled,
             stmts,
             waits,
+            spare,
             tx,
             last,
             ..
@@ -1114,6 +1137,11 @@ impl Conn {
                                     ready.extend_from_slice(&w.count.to_le_bytes());
                                     ready.extend_from_slice(&w.rows);
                                     done(ready, at);
+                                    let mut rows = w.rows;
+                                    if rows.capacity() <= SPARE_SIZE && spare.len() < SPARE_MAX {
+                                        rows.clear();
+                                        spare.push(rows);
+                                    }
                                 }
                                 None => record(ready, w.id, 2, b"dox_postgres_native: no columns"),
                             }
@@ -1128,6 +1156,9 @@ impl Conn {
                 // PortalSuspended
                 _ => {}
             }
+        }
+        if waits.is_empty() && waits.capacity() > 1024 {
+            *waits = VecDeque::new(); // do not keep a big queue forever
         }
         Ok(p)
     }

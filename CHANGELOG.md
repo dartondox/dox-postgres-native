@@ -6,6 +6,7 @@
 - A dead isolate (eg. killed, or an uncaught error) now closes its connections within about 100 ms. An open transaction of it is rolled back by the server.
 - The `threads` option of `PgNativePool.open` and `fromUrl` does nothing now. It stays so code that sets it still works.
 - A transaction id still works in any isolate. Its requests go to the isolate that started it, and the answers come back.
+- Less memory. A connection reads a chunk, then its messages, then the next chunk, so its read buffer stays small (64 KiB) also when many answers come at once. Read and write buffers that grew over 256 KiB are freed once empty. Row buffers are reused.
 - The host name is looked up when the pool opens, and again on a background thread after a connect fails (eg. after a database failover moves the name to another IP). The isolate never waits for DNS.
 - The native ABI version is now 6 (`dpg_connect` has no `threads`; `dpg_open`, `dpg_submit` and `dpg_run` work on the link of one isolate; the leaf calls never call the Dart API).
 
