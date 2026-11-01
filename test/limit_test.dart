@@ -126,6 +126,81 @@ void main() {
     await settle(app, 0);
   });
 
+  test('a transaction id works in another isolate', () async {
+    PgNativePool pool = openPool('dpg_xtx_$pid', 2);
+    await pool.query('DROP TABLE IF EXISTS pgn_xtx');
+    await pool.query('CREATE TABLE pgn_xtx (v int)');
+    ReceivePort fromChild = ReceivePort();
+    StreamIterator<Object?> msgs = StreamIterator<Object?>(fromChild);
+    await Isolate.spawn(_beginHere, <Object>[pool.handle, fromChild.sendPort]);
+    expect(await msgs.moveNext(), isTrue);
+    SendPort toChild = msgs.current as SendPort;
+    expect(await msgs.moveNext(), isTrue);
+    int tx = msgs.current as int;
+    // the other isolate started it and inserted 1; this one goes on
+    await pool.query('INSERT INTO pgn_xtx VALUES (2)', transaction: tx);
+    PgNativeResult inside = await pool.query(
+      'SELECT count(*) AS n FROM pgn_xtx',
+      transaction: tx,
+    );
+    expect(inside.rows.single['n'], 2);
+    expect(
+      (await pool.query('SELECT count(*) AS n FROM pgn_xtx')).rows.single['n'],
+      0,
+      reason: 'not committed yet',
+    );
+    await pool.commit(tx);
+    PgNativeResult all = await pool.query('SELECT v FROM pgn_xtx ORDER BY v');
+    expect(all.rows, <Map<String, dynamic>>[
+      <String, dynamic>{'v': 1},
+      <String, dynamic>{'v': 2},
+    ]);
+    await expectLater(
+      pool.query('SELECT 1', transaction: tx),
+      throwsA(
+        isA<PgException>().having(
+          (PgException e) => e.message,
+          'message',
+          'the transaction is closed',
+        ),
+      ),
+    );
+    toChild.send('done');
+    expect(await msgs.moveNext(), isTrue);
+    await msgs.cancel();
+    await pool.query('DROP TABLE pgn_xtx');
+    pool.close();
+  });
+
+  test('a transaction of a dead isolate is closed', () async {
+    PgNativePool pool = openPool('dpg_xtx_dead_$pid', 2);
+    ReceivePort fromChild = ReceivePort();
+    StreamIterator<Object?> msgs = StreamIterator<Object?>(fromChild);
+    Isolate child = await Isolate.spawn(_beginHere, <Object>[
+      pool.handle,
+      fromChild.sendPort,
+      'no table',
+    ]);
+    expect(await msgs.moveNext(), isTrue);
+    expect(await msgs.moveNext(), isTrue);
+    int tx = msgs.current as int;
+    child.kill(priority: Isolate.immediate);
+    await msgs.cancel();
+    await expectLater(
+      pool
+          .query('SELECT 1', transaction: tx)
+          .timeout(const Duration(seconds: 5)),
+      throwsA(
+        isA<PgException>().having(
+          (PgException e) => e.message,
+          'message',
+          'the transaction is closed',
+        ),
+      ),
+    );
+    pool.close();
+  });
+
   test('timeouts: a slow query, and an idle transaction', () async {
     String app = 'dpg_timeout_$pid';
     PgNativePool pool = openPool(app, 2);
@@ -212,4 +287,20 @@ Future<void> _inTx(List<Object> args) async {
   await pool.query('SELECT 1', transaction: tx);
   out.send('in tx');
   await ReceivePort().first; // never comes
+}
+
+/// Starts a transaction (inserts 1 in it, unless a third arg is given),
+/// sends its id, and stays alive until told.
+Future<void> _beginHere(List<Object> args) async {
+  PgNativePool pool = PgNativePool.fromHandle(args[0] as int);
+  SendPort out = args[1] as SendPort;
+  ReceivePort inbox = ReceivePort();
+  out.send(inbox.sendPort);
+  int tx = await pool.begin();
+  if (args.length < 3) {
+    await pool.query('INSERT INTO pgn_xtx VALUES (1)', transaction: tx);
+  }
+  out.send(tx);
+  await inbox.first;
+  out.send('bye');
 }
