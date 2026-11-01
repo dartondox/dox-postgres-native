@@ -491,6 +491,19 @@ enum Check {
     Chain,
 }
 
+impl Check {
+    /// The check for the `verify` value from Dart: 0 none, 2 the chain.
+    /// Any other value is the full check, so a bad value can not turn the
+    /// check off.
+    fn of(verify: i64) -> Check {
+        match verify {
+            0 => Check::None,
+            2 => Check::Chain,
+            _ => Check::Full,
+        }
+    }
+}
+
 /// The CA certificates to trust. With `root_cert` (a PEM file path), only
 /// the certificates in that file, like libpq `sslrootcert`. Without it,
 /// the Mozilla roots and the roots of the system.
@@ -668,7 +681,7 @@ pub unsafe extern "C" fn dpg_init(data: *mut c_void) -> i32 {
 ///
 /// `verify` checks the server certificate when TLS is on: 0 no check
 /// (`require`, `prefer`), 1 the chain and the host name (`verify-full`),
-/// 2 the chain only (`verify-ca`). `root_cert` is the path of a PEM file
+/// 2 the chain only (`verify-ca`). Any other value is `verify-full`. `root_cert` is the path of a PEM file
 /// with the CA certificates to trust (`sslrootcert`), or empty for the
 /// Mozilla and system roots.
 ///
@@ -701,11 +714,7 @@ pub unsafe extern "C" fn dpg_connect(
         return -1;
     };
     let max_size = max_size.max(1) as usize;
-    let check = match verify {
-        1 => Check::Full,
-        2 => Check::Chain,
-        _ => Check::None,
-    };
+    let check = Check::of(verify);
     // sslmode is in `cfg`, so the key has all the TLS settings
     let key = format!("{max_size} {check:?} {root_cert:?} {text}");
     pools(|r| {
@@ -870,6 +879,15 @@ mod tests {
             ),
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn an_unknown_verify_value_is_the_full_check() {
+        assert_eq!(Check::of(0), Check::None);
+        assert_eq!(Check::of(1), Check::Full);
+        assert_eq!(Check::of(2), Check::Chain);
+        assert_eq!(Check::of(-1), Check::Full);
+        assert_eq!(Check::of(7), Check::Full);
     }
 
     #[test]
