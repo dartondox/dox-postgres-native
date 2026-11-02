@@ -403,6 +403,10 @@ struct Pool {
     wanted: AtomicUsize,
     /// the request timeout in ms (tests make it shorter)
     timeout_ms: AtomicU64,
+    /// goes up after each CREATE, ALTER or DROP on a connection of this
+    /// pool. A statement prepared before it is not used again: its param
+    /// types were picked for the old tables.
+    schema: AtomicU64,
     state: Mutex<PoolState>,
 }
 
@@ -741,6 +745,7 @@ pub unsafe extern "C" fn dpg_connect(
             closed: AtomicBool::new(false),
             wanted: AtomicUsize::new(0),
             timeout_ms: AtomicU64::new(TIMEOUT.as_millis() as u64),
+            schema: AtomicU64::new(0),
             state: Mutex::new(PoolState {
                 open: 0,
                 idle: Vec::new(),
