@@ -175,6 +175,38 @@ void main() {
     await native.query('DROP TABLE pgn_alter');
   });
 
+  test('a table rebuilt with another column type keeps text as text', () async {
+    // one connection, so the second insert finds the cached statement
+    PgNativePool one = PgNativePool.open(
+      host: host,
+      port: port,
+      user: 'postgres',
+      password: 'postgres',
+      database: 'postgres',
+      maxConnections: 1,
+    );
+    String insert = r'INSERT INTO pgn_rebuilt (v) VALUES ($1)';
+    String select = r'SELECT v FROM pgn_rebuilt WHERE v = $1';
+    await one.query('DROP TABLE IF EXISTS pgn_rebuilt');
+    await one.query('CREATE TABLE pgn_rebuilt (v int)');
+    await one.query(insert, parameters: <Object?>['7']);
+    expect(
+      (await one.query(select, parameters: <Object?>['7'])).rows.single['v'],
+      7,
+    );
+    await one.query('DROP TABLE pgn_rebuilt');
+    await one.query('CREATE TABLE pgn_rebuilt (v text)');
+    await one.query(insert, parameters: <Object?>['007']);
+    expect(
+      (await one.query(select, parameters: <Object?>['007'])).rows,
+      <Map<String, dynamic>>[
+        <String, dynamic>{'v': '007'},
+      ],
+    );
+    await one.query('DROP TABLE pgn_rebuilt');
+    one.close();
+  });
+
   test('a big result (sent without a copy) and int params', () async {
     // over 64 KiB: Rust gives the bytes to Dart as external typed data
     PgNativeResult r = await native.query(

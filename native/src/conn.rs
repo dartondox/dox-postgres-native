@@ -28,6 +28,7 @@ use std::collections::{HashMap, VecDeque};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::{ErrorKind, Read, Write};
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use bytes::{Buf, Bytes, BytesMut};
@@ -233,22 +234,37 @@ struct Stmt {
     name: String,
     sql: Bytes,
     oids: Vec<u32>,
+    /// `schema` of the pool when it was prepared
+    schema: u64,
     /// the column part of the result record, from its Describe
     cols: Option<Vec<u8>>,
     /// the tick of its last use, for the LRU
     used: u64,
 }
 
-/// The key of a statement in the cache: a hash of the sql and the types.
+/// The key of a statement in the cache: a hash of the sql, the types and
+/// the `schema` count of the pool. After a CREATE, ALTER or DROP the key
+/// is new, so the statement is prepared again: a param without a type
+/// (oid 0) gets its type from the new tables. Postgres keeps the param
+/// types of a prepared statement when it plans it again, so '007' sent
+/// to a column that was int and is now text would be stored as '7'. The
+/// old statements stay until the LRU closes them, so a query that still
+/// waits for its answer finds its columns.
 // ponytail: a 64-bit hash. Two statements with the same hash (about 1 in
 // 2^64) take turns in the cache: the one there is closed.
-fn key(req: &Request) -> u64 {
+fn key(req: &Request, schema: u64) -> u64 {
     let mut h = DefaultHasher::new();
+    schema.hash(&mut h);
     req.sql.hash(&mut h);
     for p in &req.params {
         p.oid.hash(&mut h);
     }
     h.finish()
+}
+
+/// The CommandComplete tag of a schema change.
+fn is_ddl(tag: &[u8]) -> bool {
+    tag.starts_with(b"CREATE") || tag.starts_with(b"ALTER") || tag.starts_with(b"DROP")
 }
 
 /// The statement to close before a new one with key `k` goes into
@@ -570,6 +586,7 @@ impl Conn {
             return Err(Fail::text("dox_postgres_native: the sql is not UTF-8"));
         };
         let Conn {
+            pool,
             stmts,
             out,
             waits,
@@ -578,12 +595,14 @@ impl Conn {
             tick,
             ..
         } = self;
-        let k = key(&req);
+        let schema = pool.schema.load(Ordering::Relaxed);
+        let k = key(&req, schema);
         *tick += 1;
         let cached = !retry
             && match stmts.get_mut(&k) {
                 Some(s)
-                    if s.sql == req.sql
+                    if s.schema == schema
+                        && s.sql == req.sql
                         && s.oids.iter().copied().eq(req.params.iter().map(|p| p.oid)) =>
                 {
                     s.used = *tick;
@@ -648,6 +667,7 @@ impl Conn {
                     name,
                     sql: req.sql.clone(),
                     oids: req.params.iter().map(|p| p.oid).collect(),
+                    schema,
                     cols: None,
                     used: *tick,
                 },
@@ -1057,6 +1077,7 @@ impl Conn {
         retries: &mut Vec<(u64, Request, Instant)>,
     ) -> Result<usize, Fail> {
         let Conn {
+            pool,
             inb,
             filled,
             stmts,
@@ -1118,6 +1139,14 @@ impl Conn {
                     if w.fail.is_none() {
                         w.fail = Some(Fail(1, error_body(body)));
                     }
+                }
+                // CommandComplete of a schema change: the cached
+                // statements of all connections of the pool are old.
+                // ponytail: DDL inside DO or a function, or from another
+                // process, is not seen; a query already sent behind the
+                // DDL also keeps its old statement.
+                b'C' if is_ddl(body) => {
+                    pool.schema.fetch_add(1, Ordering::Relaxed);
                 }
                 b'Z' => {
                     let w = waits.pop_front().unwrap();
@@ -1210,6 +1239,15 @@ mod tests {
     }
 
     #[test]
+    fn schema_changes_are_seen() {
+        assert!(is_ddl(b"CREATE TABLE\0"));
+        assert!(is_ddl(b"ALTER TABLE\0"));
+        assert!(is_ddl(b"DROP TABLE\0"));
+        assert!(!is_ddl(b"INSERT 0 1\0"));
+        assert!(!is_ddl(b"SELECT 1\0"));
+    }
+
+    #[test]
     fn short_or_broken_messages_are_errors_not_panics() {
         // RowDescription: no count, a name with no end, no type oid
         assert!(columns(&[]).is_err());
@@ -1234,6 +1272,7 @@ mod tests {
             name: format!("s{used}"),
             sql: Bytes::new(),
             oids: Vec::new(),
+            schema: 0,
             cols: None,
             used,
         }

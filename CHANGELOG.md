@@ -1,3 +1,7 @@
+## Unreleased
+
+- Fix: a text param could be stored with the wrong type after a table was changed. Example: a column was `int`, the table was dropped and made again with a `text` column, then `'007'` was inserted with the same SQL. It was stored as `'7'`, and `WHERE v = '007'` failed with "operator does not exist". The cause: a param without a type gets its type when the statement is prepared, and Postgres keeps that type when it plans the statement again. Now a `CREATE`, `ALTER` or `DROP` on any connection of the pool makes every connection prepare its statements again. Normal queries do no extra work. A schema change from another process, or inside `DO` or a function, is not seen.
+
 ## 3.0.2
 
 - Fix: when the server ended a connection, its last error and the close could come in one read. The driver then missed the close, and the query on it waited for the 300 s timeout. It now reads on to the end when the server closes.
