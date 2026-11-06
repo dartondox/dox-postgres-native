@@ -207,6 +207,78 @@ void main() {
     one.close();
   });
 
+  test('a table rebuilt inside DO keeps text as text', () async {
+    PgNativePool one = PgNativePool.open(
+      host: host,
+      port: port,
+      user: 'postgres',
+      password: 'postgres',
+      database: 'postgres',
+      maxConnections: 1,
+    );
+    String insert = r'INSERT INTO pgn_do (v) VALUES ($1)';
+    await one.query('DROP TABLE IF EXISTS pgn_do');
+    await one.query('CREATE TABLE pgn_do (v int)');
+    await one.query(insert, parameters: <Object?>['7']);
+    await one.query(
+      'DO \$\$ BEGIN DROP TABLE pgn_do; CREATE TABLE pgn_do (v text); END \$\$',
+    );
+    await one.query(insert, parameters: <Object?>['007']);
+    expect((await one.query('SELECT v FROM pgn_do')).rows.single['v'], '007');
+    await one.query('DROP TABLE pgn_do');
+    one.close();
+  });
+
+  test('a result type changed by another pool is prepared again', () async {
+    // two pools (other settings): the change is not seen by the
+    // schema count of `one`, so its cached statement gets 0A000
+    PgNativePool one = PgNativePool.open(
+      host: host,
+      port: port,
+      user: 'postgres',
+      password: 'postgres',
+      database: 'postgres',
+      maxConnections: 1,
+    );
+    PgNativePool other = PgNativePool.open(
+      host: host,
+      port: port,
+      user: 'postgres',
+      password: 'postgres',
+      database: 'postgres',
+      maxConnections: 2,
+    );
+    String select = 'SELECT v FROM pgn_other';
+    await other.query('DROP TABLE IF EXISTS pgn_other');
+    await other.query('CREATE TABLE pgn_other (v int)');
+    await other.query('INSERT INTO pgn_other VALUES (7)');
+    expect((await one.query(select)).rows.single['v'], 7);
+    await other.query('ALTER TABLE pgn_other ALTER COLUMN v TYPE text');
+    expect((await one.query(select)).rows.single['v'], '7');
+
+    // in a transaction there is no retry: Dart gets the real error.
+    // The retry used an unnamed statement: cache it again first.
+    expect((await one.query(select)).rows.single['v'], '7');
+    await other.query(
+      'ALTER TABLE pgn_other ALTER COLUMN v TYPE int USING v::int',
+    );
+    int tx = await one.begin();
+    await expectLater(
+      one.query(select, transaction: tx),
+      throwsA(
+        isA<PgServerException>().having(
+          (PgServerException e) => e.code,
+          'code',
+          '0A000',
+        ),
+      ),
+    );
+    await one.rollback(tx);
+    await other.query('DROP TABLE pgn_other');
+    one.close();
+    other.close();
+  });
+
   test('a big result (sent without a copy) and int params', () async {
     // over 64 KiB: Rust gives the bytes to Dart as external typed data
     PgNativeResult r = await native.query(
