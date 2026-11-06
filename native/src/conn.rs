@@ -61,6 +61,15 @@ const SPARE_SIZE: usize = 16 * 1024;
 /// Error codes after which a query is sent once more, with a new Parse:
 /// the statement is gone (eg. its Parse failed) or its plan is out of date
 /// (eg. after ALTER TABLE).
+///
+/// The retry does not run the query twice. "cached plan must not change
+/// result type" (0A000) comes from the plan check at Bind, before the
+/// query runs. Any other error, also a late 0A000, ends the query's own
+/// implicit transaction (each query has its own Sync), so the server rolls
+/// back what it did. Only effects that a rollback does not undo (eg.
+/// `nextval`) could happen twice. Inside a transaction there is no retry:
+/// the error aborts the transaction, so a retry could only fail, and Dart
+/// gets the real error.
 const GONE: &[u8] = b"26000";
 const STALE: &[u8] = b"0A000";
 
@@ -262,9 +271,13 @@ fn key(req: &Request, schema: u64) -> u64 {
     h.finish()
 }
 
-/// The CommandComplete tag of a schema change.
+/// The CommandComplete tag of a schema change. `DO` counts too: it is
+/// mostly used for migrations.
 fn is_ddl(tag: &[u8]) -> bool {
-    tag.starts_with(b"CREATE") || tag.starts_with(b"ALTER") || tag.starts_with(b"DROP")
+    tag.starts_with(b"CREATE")
+        || tag.starts_with(b"ALTER")
+        || tag.starts_with(b"DROP")
+        || tag == b"DO\0"
 }
 
 /// The statement to close before a new one with key `k` goes into
@@ -1134,7 +1147,8 @@ impl Conn {
                             // next query prepares it again
                             stmts.remove(k);
                         }
-                        w.retry = stale && !*parsing && req.is_some();
+                        // not in a transaction (see GONE)
+                        w.retry = stale && !*parsing && req.as_ref().is_some_and(|r| r.tx == 0);
                     }
                     if w.fail.is_none() {
                         w.fail = Some(Fail(1, error_body(body)));
@@ -1142,9 +1156,11 @@ impl Conn {
                 }
                 // CommandComplete of a schema change: the cached
                 // statements of all connections of the pool are old.
-                // ponytail: DDL inside DO or a function, or from another
+                // ponytail: DDL inside a function, or from another
                 // process, is not seen; a query already sent behind the
-                // DDL also keeps its old statement.
+                // DDL also keeps its old statement. A changed result type
+                // is still caught: 0A000, then one retry (see GONE). Only
+                // the param types of a statement stay old.
                 b'C' if is_ddl(body) => {
                     pool.schema.fetch_add(1, Ordering::Relaxed);
                 }
@@ -1245,6 +1261,8 @@ mod tests {
         assert!(is_ddl(b"DROP TABLE\0"));
         assert!(!is_ddl(b"INSERT 0 1\0"));
         assert!(!is_ddl(b"SELECT 1\0"));
+        assert!(is_ddl(b"DO\0"));
+        assert!(!is_ddl(b"DELETE 1\0"));
     }
 
     #[test]
