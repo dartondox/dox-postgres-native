@@ -1,5 +1,7 @@
 ## 3.0.3
 
+- Fix: a short or broken server message, or a negative length from Dart, no longer aborts the Dart process. Before, a Rust panic killed the whole process. Now you get an error.
+- Fix: an unknown `verify` value in `dpg_connect` now means the full check (`verify-full`). Before, any value other than 1 or 2 turned the certificate check off. Dart only sends 0, 1 or 2, so apps see no change.
 - Fix: a text param could be stored with the wrong type after a table was changed. Example: a column was `int`, the table was dropped and made again with a `text` column, then `'007'` was inserted with the same SQL. It was stored as `'7'`, and `WHERE v = '007'` failed with "operator does not exist". The cause: a param without a type gets its type when the statement is prepared, and Postgres keeps that type when it plans the statement again. Now a `CREATE`, `ALTER` or `DROP` on any connection of the pool makes every connection prepare its statements again. Normal queries do no extra work. A `DO` block counts as a schema change too. A schema change from another process, or inside a function, is not seen for the param types. A changed result type is still caught there: Postgres says "cached plan must not change result type", and the query is prepared again and sent once more.
 - A query in a transaction is no longer sent again after "cached plan must not change result type" (or "prepared statement does not exist"). The error already ended the transaction, so the second try could only fail with "current transaction is aborted". Now you get the real error.
 
