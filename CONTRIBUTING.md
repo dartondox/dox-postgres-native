@@ -14,7 +14,7 @@ For security problems, see [SECURITY.md](SECURITY.md). Do not open a public issu
 Send changes as pull requests against `main`. Before you ask for review:
 
 - CI is green.
-- In `native/`: `cargo fmt`, `cargo clippy -- -D warnings` and `cargo test` pass.
+- In `native/`: `cargo fmt`, `cargo clippy --release --all-targets -- -D warnings` and `cargo test` pass.
 - `dart format` is clean.
 - `dart analyze --fatal-infos` has no warnings.
 - Add a changelog entry under `## Unreleased` in `CHANGELOG.md`.
