@@ -1,3 +1,7 @@
+## Unreleased
+
+- Fix: the build hook now tries the download of the native library up to 3 times (waits 1 s, then 3 s). Before, one bad answer from GitHub (eg. 503 or 504) meant no native library, and the app stopped at start. It tries again on a 5xx or 429 status, a connection error or timeout, and a wrong sha256. A 404 is not tried again. If all 3 tries fail, nothing changes: the hook falls back to cargo or adds no library.
+
 ## 3.0.3
 
 - Fix: a short or broken server message, or a negative length from Dart, no longer aborts the Dart process. Before, a Rust panic killed the whole process. Now you get an error.

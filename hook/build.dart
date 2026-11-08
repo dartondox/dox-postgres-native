@@ -23,6 +23,11 @@ import 'package:hooks/hooks.dart';
 const String _releases =
     'https://github.com/dartondox/dox-postgres-native/releases/download';
 
+const int _attempts = 3;
+
+/// Seconds to wait before the 2nd and the 3rd try.
+const List<int> _waitSeconds = <int>[1, 3];
+
 /// sha256 of each release asset. The release workflow
 /// (.github/workflows/ci.yaml) fills it from `SHA256SUMS` of the release:
 /// `dart run tool/native_hashes.dart v<version>`
@@ -116,37 +121,56 @@ Future<Uri?> _download(
   if (file.existsSync() && _sha(file.readAsBytesSync()) == hash) {
     return file.uri;
   }
-  // a stalled download must not hang the build forever
-  HttpClient client = HttpClient()
-    ..connectionTimeout = const Duration(seconds: 30);
-  try {
-    HttpClientRequest req = await client.getUrl(
-      Uri.parse('$_releases/v$version/$asset'),
-    );
-    HttpClientResponse res = await req.close();
-    if (res.statusCode != 200) {
-      stderr.writeln('dox_postgres_native: download $asset: ${res.statusCode}');
-      return null;
+  // GitHub sometimes answers 503 or 504. Try up to 3 times, with a short wait.
+  for (int attempt = 1; attempt <= _attempts; attempt++) {
+    if (attempt > 1) {
+      await Future<void>.delayed(Duration(seconds: _waitSeconds[attempt - 2]));
     }
-    List<int> bytes = <int>[
-      for (List<int> chunk
-          in await res.timeout(const Duration(seconds: 60)).toList())
-        ...chunk,
-    ];
-    if (_sha(bytes) != hash) {
-      stderr.writeln('dox_postgres_native: sha256 of $asset does not match');
-      return null;
+    String tried = '(attempt $attempt of $_attempts)';
+    // a stalled download must not hang the build forever
+    HttpClient client = HttpClient()
+      ..connectionTimeout = const Duration(seconds: 30);
+    try {
+      HttpClientRequest req = await client.getUrl(
+        Uri.parse('$_releases/v$version/$asset'),
+      );
+      HttpClientResponse res = await req.close();
+      if (res.statusCode != 200) {
+        stderr.writeln(
+          'dox_postgres_native: download $asset: ${res.statusCode} $tried',
+        );
+        if (shouldRetryStatus(res.statusCode)) continue;
+        return null;
+      }
+      List<int> bytes = <int>[
+        for (List<int> chunk
+            in await res.timeout(const Duration(seconds: 60)).toList())
+          ...chunk,
+      ];
+      if (_sha(bytes) != hash) {
+        // the body may be an error page, so try again
+        stderr.writeln(
+          'dox_postgres_native: sha256 of $asset does not match $tried',
+        );
+        continue;
+      }
+      file.parent.createSync(recursive: true);
+      file.writeAsBytesSync(bytes);
+      return file.uri;
+    } on Exception catch (error) {
+      stderr.writeln(
+        'dox_postgres_native: download $asset failed: $error $tried',
+      );
+    } finally {
+      client.close(force: true);
     }
-    file.parent.createSync(recursive: true);
-    file.writeAsBytesSync(bytes);
-    return file.uri;
-  } on Exception catch (error) {
-    stderr.writeln('dox_postgres_native: download $asset failed: $error');
-    return null;
-  } finally {
-    client.close(force: true);
   }
+  return null;
 }
+
+/// True when a new try may help: a server error (5xx) or "too many requests".
+/// A 404 means the asset does not exist, so it is not tried again.
+bool shouldRetryStatus(int status) => status == 429 || status >= 500;
 
 String _sha(List<int> bytes) => sha256.convert(bytes).toString();
 
