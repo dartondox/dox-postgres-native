@@ -134,14 +134,16 @@ Future<Uri?> _download(
       await Future<void>.delayed(Duration(seconds: _waitSeconds[attempt - 2]));
     }
     String tried = '(attempt $attempt of $_attempts)';
-    // a stalled download must not hang the build forever
+    // a stalled download must not hang the build forever. Each try has one
+    // time limit for the whole thing: connect, response head and body.
+    DateTime deadline = DateTime.now().add(_tryLimit);
     HttpClient client = HttpClient()
       ..connectionTimeout = const Duration(seconds: 30);
     try {
-      HttpClientRequest req = await client.getUrl(
-        Uri.parse('$_releases/v$version/$asset'),
-      );
-      HttpClientResponse res = await req.close();
+      HttpClientRequest req = await client
+          .getUrl(Uri.parse('$_releases/v$version/$asset'))
+          .timeout(_left(deadline));
+      HttpClientResponse res = await req.close().timeout(_left(deadline));
       if (res.statusCode != 200) {
         stderr.writeln(
           'dox_postgres_native: download $asset: ${res.statusCode} $tried',
@@ -150,8 +152,7 @@ Future<Uri?> _download(
         return null;
       }
       List<int> bytes = <int>[
-        for (List<int> chunk
-            in await res.timeout(const Duration(seconds: 60)).toList())
+        for (List<int> chunk in await res.toList().timeout(_left(deadline)))
           ...chunk,
       ];
       if (_sha(bytes) != hash) {
@@ -174,6 +175,12 @@ Future<Uri?> _download(
   }
   return null;
 }
+
+/// The longest time one download try may take, from connect to the last byte.
+const Duration _tryLimit = Duration(seconds: 60);
+
+/// Time left until [deadline]. Zero or less makes the next wait time out now.
+Duration _left(DateTime deadline) => deadline.difference(DateTime.now());
 
 /// True when a new try may help: a server error (5xx) or "too many requests".
 /// A 404 means the asset does not exist, so it is not tried again.

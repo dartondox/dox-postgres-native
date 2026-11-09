@@ -136,7 +136,7 @@ hooks:
       skip: true
 ```
 
-Then no library is downloaded or built. Only a real `true` counts.
+Then no library is downloaded or built. Only a real `true` counts. The text `'true'` in quotes does not skip.
 If the app still opens a pool, it throws an error that says the library is not in the build.
 
 ## Features

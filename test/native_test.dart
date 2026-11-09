@@ -274,6 +274,22 @@ void main() {
       ),
     );
     await one.rollback(tx);
+
+    // a transaction opened by hand is seen too (the ReadyForQuery status)
+    expect((await one.query(select)).rows.single['v'], 7);
+    await other.query('ALTER TABLE pgn_other ALTER COLUMN v TYPE text');
+    await one.query('BEGIN');
+    await expectLater(
+      one.query(select),
+      throwsA(
+        isA<PgServerException>().having(
+          (PgServerException e) => e.code,
+          'code',
+          '0A000',
+        ),
+      ),
+    );
+    await one.query('ROLLBACK');
     await other.query('DROP TABLE pgn_other');
     one.close();
     other.close();

@@ -350,16 +350,24 @@ fn resolve(c: &Config) -> Result<Vec<Addr>, Fail> {
             "dox_postgres_native: Unix sockets do not work on this platform",
         ));
     }
-    let failed = |e: String| Fail::text(&format!("error connecting to server: {e}"));
     let addrs: Vec<Addr> = (c.host.as_str(), c.port)
         .to_socket_addrs()
-        .map_err(|e| failed(e.to_string()))?
+        .map_err(|e| dial_error(c, e))?
         .map(Addr::Tcp)
         .collect();
     if addrs.is_empty() {
-        return Err(failed("no address".into()));
+        return Err(dial_error(c, "no address"));
     }
     Ok(addrs)
+}
+
+/// A connect error that says the host and port, so a wrong one is easy to
+/// see. Never the password.
+fn dial_error(c: &Config, e: impl std::fmt::Display) -> Fail {
+    Fail::text(&format!(
+        "error connecting to server at \"{}\", port {}: {e}",
+        c.host, c.port
+    ))
 }
 
 // ---- pools -------------------------------------------------------------
@@ -846,6 +854,18 @@ mod tests {
         assert_eq!((rd64(out, 17), out[25], rd32(out, 26)), (10, 3, 8));
         assert_eq!(rd64(out, 30), 5);
         assert_eq!(out.len(), 38);
+    }
+
+    #[test]
+    fn connect_error_names_host_and_port() {
+        let c = parse_config("host=db.local port=6543 user=u password=secret").unwrap();
+        let Fail(_, text) = dial_error(&c, "Connection refused");
+        let text = String::from_utf8(text).unwrap();
+        assert_eq!(
+            text,
+            "error connecting to server at \"db.local\", port 6543: Connection refused"
+        );
+        assert!(!text.contains("secret"));
     }
 
     #[test]
