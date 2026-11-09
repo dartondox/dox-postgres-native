@@ -42,8 +42,8 @@ use postgres_protocol::authentication::sasl::{ChannelBinding, ScramSha256};
 use postgres_protocol::message::frontend;
 
 use crate::{
-    Addr, CACHE_MAX, Fail, INTERNAL, Pool, Request, Ssl, TIMED_OUT, done, fail, head, record,
-    refresh,
+    Addr, CACHE_MAX, Fail, INTERNAL, Pool, Request, Ssl, TIMED_OUT, dial_error, done, fail, head,
+    record, refresh,
 };
 
 /// Smallest free room in a read buffer before a read.
@@ -459,10 +459,10 @@ impl Conn {
                 Err(e) => last = Some(e),
             }
         }
-        Err(connect_error(last.map_or_else(
-            || "no address".to_string(),
-            |e| e.to_string(),
-        )))
+        Err(dial_error(
+            &pool.cfg,
+            last.map_or_else(|| "no address".to_string(), |e| e.to_string()),
+        ))
     }
 
     fn interest(&self) -> Interest {
@@ -518,7 +518,7 @@ impl Conn {
         if !matches!(self.state, State::Ready) {
             if now >= self.until {
                 refresh(&self.pool);
-                return Err(connect_error("connection timed out"));
+                return Err(dial_error(&self.pool.cfg, "connection timed out"));
             }
             return Ok(());
         }
@@ -827,7 +827,7 @@ impl Conn {
             }
         }
         refresh(&self.pool);
-        Err(connect_error(e))
+        Err(dial_error(&self.pool.cfg, e))
     }
 
     /// Writes the startup message and waits for the login.
