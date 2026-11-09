@@ -66,10 +66,13 @@ const SPARE_SIZE: usize = 16 * 1024;
 /// result type" (0A000) comes from the plan check at Bind, before the
 /// query runs. Any other error, also a late 0A000, ends the query's own
 /// implicit transaction (each query has its own Sync), so the server rolls
-/// back what it did. Only effects that a rollback does not undo (eg.
-/// `nextval`) could happen twice. Inside a transaction there is no retry:
-/// the error aborts the transaction, so a retry could only fail, and Dart
-/// gets the real error.
+/// back what it did. Only effects that a rollback does not undo could
+/// happen twice: eg. `nextval`, a session advisory lock
+/// (`pg_advisory_lock`), or work done on another server with `dblink`.
+/// Inside a transaction there is no retry: the error aborts the
+/// transaction, so a retry could only fail, and Dart gets the real error.
+/// The ReadyForQuery status byte says this, so a transaction opened by
+/// hand with `query('BEGIN')` counts too.
 const GONE: &[u8] = b"26000";
 const STALE: &[u8] = b"0A000";
 
@@ -1147,8 +1150,9 @@ impl Conn {
                             // next query prepares it again
                             stmts.remove(k);
                         }
-                        // not in a transaction (see GONE)
-                        w.retry = stale && !*parsing && req.as_ref().is_some_and(|r| r.tx == 0);
+                        // sent again only if the connection is idle after it
+                        // (see GONE and the ReadyForQuery below)
+                        w.retry = stale && !*parsing && req.is_some();
                     }
                     if w.fail.is_none() {
                         w.fail = Some(Fail(1, error_body(body)));
@@ -1169,7 +1173,9 @@ impl Conn {
                     if tx.is_some() {
                         *last = Instant::now();
                     }
-                    if w.retry {
+                    // `I`: idle, so not in a transaction. This also sees
+                    // a transaction opened by hand with `query('BEGIN')`.
+                    if w.retry && body.first() == Some(&b'I') {
                         if let Kind::Query { req: Some(req), .. } = w.kind {
                             retries.push((w.id, req, w.at));
                         }
