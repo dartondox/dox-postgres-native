@@ -1,6 +1,12 @@
 // Ships the native library of dox_postgres_native as a code asset.
 //
 // Where the library comes from, first match wins:
+// 0. The `skip: true` user define: no library at all. `open` then throws.
+//    In the root pubspec.yaml of the app:
+//      hooks:
+//        user_defines:
+//          dox_postgres_native:
+//            skip: true
 // 1. The `lib_path` user define: a path to a ready library (for dev).
 //    In the root pubspec.yaml of the app:
 //      hooks:
@@ -47,6 +53,7 @@ const Map<String, String> _sha256 = <String, String>{
 void main(List<String> args) async {
   await build(args, (BuildInput input, BuildOutputBuilder output) async {
     if (!input.config.buildCodeAssets) return;
+    if (input.userDefines['skip'] == true) return; // no library, on purpose
     CodeConfig code = input.config.code;
     OS os = code.targetOS;
     Architecture arch = code.targetArchitecture;
