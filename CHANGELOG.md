@@ -1,5 +1,6 @@
 ## Unreleased
 
+- New: the user define `skip: true` turns off the build hook. The library is not downloaded or built. Use it in an app that does not use this database. Without it, nothing changes. If the library is missing, the error now says so, and tells you to remove `skip`.
 - Fix: the build hook now tries the download of the native library up to 3 times (waits 1 s, then 3 s). Before, one bad answer from GitHub (eg. 503 or 504) meant no native library, and the app stopped at start. It tries again on a 5xx or 429 status, a connection error or timeout, and a wrong sha256. A 404 is not tried again. If all 3 tries fail, nothing changes: the hook falls back to cargo or adds no library.
 
 ## 3.0.3

@@ -89,7 +89,10 @@ class PgNativePool {
       return true;
     } catch (error) {
       // the build hook found no library for this platform
-      _loadError = '$error';
+      _loadError =
+          'the native library is not in the build ($error). If `skip: true` '
+          'is set for dox_postgres_native under `hooks: user_defines:` in pubspec.yaml, '
+          'remove it.';
       return false;
     }
   }
