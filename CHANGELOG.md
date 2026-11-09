@@ -1,3 +1,7 @@
+## Unreleased
+
+- Fix: each download try of the native library now has one time limit of 60 s, from connect to the last byte. Before, there was no limit while waiting for the answer, and the 60 s limit for the body only counted the gap between two chunks. So a slow server could hang the build for a long time. Now 3 tries take about 3 minutes at most.
+
 ## 3.0.4
 
 - New: the user define `skip: true` turns off the build hook. The library is not downloaded or built. Use it in an app that does not use this database. Without it, nothing changes. If the library is missing, the error now says so, and tells you to remove `skip`.
