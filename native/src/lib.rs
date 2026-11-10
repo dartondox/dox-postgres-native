@@ -364,10 +364,16 @@ fn resolve(c: &Config) -> Result<Vec<Addr>, Fail> {
 /// A connect error that says the host and port, so a wrong one is easy to
 /// see. Never the password.
 fn dial_error(c: &Config, e: impl std::fmt::Display) -> Fail {
-    Fail::text(&format!(
-        "error connecting to server at \"{}\", port {}: {e}",
-        c.host, c.port
-    ))
+    at_server(c, "error connecting to server", e)
+}
+
+/// A failed TLS handshake, with the host and port like [dial_error].
+fn tls_error(c: &Config, e: impl std::fmt::Display) -> Fail {
+    at_server(c, "error performing TLS handshake with server", e)
+}
+
+fn at_server(c: &Config, what: &str, e: impl std::fmt::Display) -> Fail {
+    Fail::text(&format!("{what} at \"{}\", port {}: {e}", c.host, c.port))
 }
 
 // ---- pools -------------------------------------------------------------
@@ -864,6 +870,14 @@ mod tests {
         assert_eq!(
             text,
             "error connecting to server at \"db.local\", port 6543: Connection refused"
+        );
+        assert!(!text.contains("secret"));
+        let Fail(_, text) = tls_error(&c, "server does not support TLS");
+        let text = String::from_utf8(text).unwrap();
+        assert_eq!(
+            text,
+            "error performing TLS handshake with server at \"db.local\", port 6543: \
+             server does not support TLS"
         );
         assert!(!text.contains("secret"));
     }
