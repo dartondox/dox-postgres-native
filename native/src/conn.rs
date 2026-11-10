@@ -43,7 +43,7 @@ use postgres_protocol::message::frontend;
 
 use crate::{
     Addr, CACHE_MAX, Fail, INTERNAL, Pool, Request, Ssl, TIMED_OUT, dial_error, done, fail, head,
-    record, refresh,
+    record, refresh, tls_error,
 };
 
 /// Smallest free room in a read buffer before a read.
@@ -185,10 +185,6 @@ fn row(out: &mut Vec<u8>, b: &[u8]) -> Result<(), Fail> {
         }
     }
     Ok(())
-}
-
-fn connect_error(e: impl std::fmt::Display) -> Fail {
-    Fail::text(&format!("error connecting to server: {e}"))
 }
 
 fn write_error(e: impl std::fmt::Display) -> Fail {
@@ -823,7 +819,8 @@ impl Conn {
                 Ok(s) => {
                     self.sock = s;
                     self.writable = true;
-                    self.register(reg, token).map_err(connect_error)?;
+                    self.register(reg, token)
+                        .map_err(|e| dial_error(&self.pool.cfg, e))?;
                     return Ok(false);
                 }
                 Err(e2) => e = e2,
@@ -846,7 +843,7 @@ impl Conn {
         if let Some(a) = &c.application_name {
             params.push(("application_name", a));
         }
-        frontend::startup_message(params, &mut self.out).map_err(connect_error)?;
+        frontend::startup_message(params, &mut self.out).map_err(|e| dial_error(c, e))?;
         self.state = State::Auth(None);
         Ok(())
     }
@@ -856,12 +853,13 @@ impl Conn {
         let answer = self.inb[0];
         // more bytes before the handshake: someone in the middle
         if self.filled > 1 {
-            return Err(connect_error(
+            return Err(dial_error(
+                &self.pool.cfg,
                 "the server sent data before the TLS handshake",
             ));
         }
         self.filled = 0;
-        let handshake = |e: String| Fail::text(&format!("error performing TLS handshake: {e}"));
+        let handshake = |e: String| tls_error(&self.pool.cfg, e);
         match answer {
             b'S' => {
                 let config = self.pool.tls.clone().expect("TLS config");
@@ -876,7 +874,7 @@ impl Conn {
                 return Err(handshake("server does not support TLS".into()));
             }
             b'N' => {} // prefer: plain text
-            _ => return Err(connect_error("bad answer to the SSLRequest")),
+            _ => return Err(dial_error(&self.pool.cfg, "bad answer to the SSLRequest")),
         }
         self.startup()
     }
@@ -895,6 +893,7 @@ impl Conn {
     /// came with the data and brings no new event, so read on to see it.
     fn fill(&mut self, closed: bool) -> Result<(bool, bool), Fail> {
         let Conn {
+            pool,
             sock,
             tls,
             inb,
@@ -936,12 +935,10 @@ impl Conn {
             };
             let handshaking = tls.is_handshaking();
             if let Err(e) = tls.process_new_packets() {
-                let what = if handshaking {
-                    "error performing TLS handshake"
-                } else {
-                    "TLS error"
-                };
-                return Err(Fail::text(&format!("{what}: {e}")));
+                if handshaking {
+                    return Err(tls_error(&pool.cfg, e));
+                }
+                return Err(Fail::text(&format!("TLS error: {e}")));
             }
             loop {
                 Self::room(inb, *filled);
@@ -1023,11 +1020,11 @@ impl Conn {
 
     /// One message of the login.
     fn login(&mut self, tag: u8, body: &[u8], ready: &mut Vec<u8>) -> Result<(), Fail> {
-        let enc = |e: std::io::Error| connect_error(e);
+        let pool = self.pool.clone();
+        let c = &pool.cfg;
+        let enc = |e: std::io::Error| dial_error(c, e);
         match tag {
             b'R' => {
-                let pool = self.pool.clone();
-                let c = &pool.cfg;
                 let data = body.get(4..).ok_or_else(bad)?;
                 match be32(body, 0)? {
                     0 => {} // AuthenticationOk
@@ -1041,7 +1038,8 @@ impl Conn {
                     10 => {
                         let scram = data.split(|&b| b == 0).any(|m| m == b"SCRAM-SHA-256");
                         if !scram {
-                            return Err(connect_error(
+                            return Err(dial_error(
+                                c,
                                 "the server wants a SASL method that is not supported",
                             ));
                         }
@@ -1056,7 +1054,7 @@ impl Conn {
                     }
                     n @ (11 | 12) => {
                         let State::Auth(Some(s)) = &mut self.state else {
-                            return Err(connect_error("SASL out of order"));
+                            return Err(dial_error(c, "SASL out of order"));
                         };
                         if n == 11 {
                             s.update(data).map_err(enc)?;
@@ -1066,7 +1064,7 @@ impl Conn {
                         }
                     }
                     n => {
-                        return Err(connect_error(format!("auth method {n} is not supported")));
+                        return Err(dial_error(c, format!("auth method {n} is not supported")));
                     }
                 }
             }

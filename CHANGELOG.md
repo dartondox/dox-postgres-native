@@ -2,6 +2,8 @@
 
 - Fix: in a transaction opened by hand with `query('BEGIN')`, a query that got "cached plan must not change result type" was sent again. The second try could only fail with "current transaction is aborted" (25P02), so you did not see the real error. Now the retry looks at the transaction status the server sends after each query, and runs only when no transaction is open.
 - A failed connect now says the host and port, eg. `error connecting to server at "db.local", port 5432: Connection refused`. Before, it said only `Connection refused (os error 61)`, so a wrong host or port was hard to see. The password is never in the message.
+- Login and TLS errors from the driver now also say the host and port, eg. `error performing TLS handshake with server at "db.local", port 5432: server does not support TLS`. Before, they did not say which server. Errors that the server itself sends (eg. a wrong password) do not change.
+- When the native library is missing, the error now says to look in the app's root `pubspec.yaml` for `skip: true`. Before, it said only `pubspec.yaml`, which could mean the pubspec of a package.
 - Fix: each download try of the native library now has one time limit of 60 s, from connect to the last byte. Before, there was no limit while waiting for the answer, and the 60 s limit for the body only counted the gap between two chunks. So a slow server could hang the build for a long time. Now 3 tries take about 3 minutes at most.
 
 ## 3.0.4
