@@ -68,3 +68,12 @@ class PgServerException extends PgException {
     return out.toString();
   }
 }
+
+/// A query or stream that was stopped with `PgCancelToken.cancel`. The
+/// server stopped it, or it never ran.
+class PgQueryCancelledException extends PgException {
+  PgQueryCancelledException() : super('the query was cancelled');
+
+  @override
+  String toString() => 'PgQueryCancelledException: $message';
+}
