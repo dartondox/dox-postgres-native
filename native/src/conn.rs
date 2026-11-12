@@ -640,6 +640,12 @@ impl Conn {
         self.streams > 0
     }
 
+    /// Over the `max_age` of the pool: it takes no new request, so it
+    /// drains and the timer closes it, also under steady load.
+    pub fn old(&self, now: Instant) -> bool {
+        self.pool.max_age.is_some_and(|a| self.born + a <= now)
+    }
+
     /// Too old (`max_age` of the pool), or free too long (`idle`). Only
     /// closed when it is free.
     pub fn stale(&self, now: Instant) -> bool {

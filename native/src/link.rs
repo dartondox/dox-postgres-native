@@ -554,7 +554,7 @@ impl Core {
             l.conns
                 .iter()
                 .copied()
-                .find(|&i| conns[i].as_ref().is_some_and(Conn::idle))
+                .find(|&i| conns[i].as_ref().is_some_and(|c| c.idle() && !c.old(p.at)))
         };
         // 2. one more connection
         if pick.is_none() && !l.full {
@@ -575,7 +575,7 @@ impl Core {
                 l.pile.filter(|&i| {
                     conns[i]
                         .as_ref()
-                        .is_some_and(|c| c.tx.is_none() && !c.exclusive())
+                        .is_some_and(|c| c.tx.is_none() && !c.exclusive() && !c.old(p.at))
                 })
             } else {
                 l.conns
@@ -584,7 +584,7 @@ impl Core {
                     .filter(|&i| {
                         conns[i]
                             .as_ref()
-                            .is_some_and(|c| c.tx.is_none() && !c.exclusive())
+                            .is_some_and(|c| c.tx.is_none() && !c.exclusive() && !c.old(p.at))
                     })
                     .min_by_key(|&i| conns[i].as_ref().map_or(usize::MAX, Conn::load))
             };

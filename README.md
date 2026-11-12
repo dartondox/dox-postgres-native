@@ -89,7 +89,7 @@ PgNativePool pool = PgNativePool.open(
 ```
 
 - `requestTimeout` (default 300 s): the longest wait for one request (a free connection, the connect and the query). Over it, the request fails with a `PgException` that says `timeout`. A CancelRequest stops the query on the server, and its connection is closed. A transaction with no request for this long is rolled back.
-- `maxConnectionAge` (default: no limit): a connection older than this is closed when it is next free. It is never closed while a query or a transaction uses it. A new one opens when it is needed. Useful behind a load balancer, or to follow a DNS change after a failover.
+- `maxConnectionAge` (default: no limit): a connection older than this is closed when it is next free. It is never closed while a query or a transaction uses it. Once it is too old it takes no new query, so it is free soon also under steady load. A new one opens when it is needed. Useful behind a load balancer, or to follow a DNS change after a failover.
 - `idleTimeout` (default: kept): a free connection that is not used for this long is closed. A new one opens when it is needed.
 
 `fromUrl` takes the same three. Isolates share one pool only when all settings are the same.

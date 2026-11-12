@@ -142,6 +142,33 @@ void main() {
       await settle(app, 0);
     });
 
+    test('maxConnectionAge works under steady load', () async {
+      String app = 'dpg_age_load_$pid';
+      PgNativePool pool = openPool(
+        app,
+        max: 1,
+        maxConnectionAge: const Duration(milliseconds: 300),
+      );
+      Set<int> pids = <int>{};
+      List<Future<void>> running = <Future<void>>[];
+      Stopwatch sw = Stopwatch()..start();
+      // a 20 ms query every 10 ms: the connection is never free
+      while (sw.elapsed < const Duration(seconds: 2)) {
+        running.add(
+          pool.query('SELECT pg_backend_pid() AS p, pg_sleep(0.02)').then((
+            PgNativeResult r,
+          ) {
+            pids.add(r.rows.single['p'] as int);
+          }),
+        );
+        await Future<void>.delayed(const Duration(milliseconds: 10));
+      }
+      await Future.wait(running);
+      expect(pids.length, greaterThan(1));
+      pool.close();
+      await settle(app, 0);
+    });
+
     test('idleTimeout closes a free connection', () async {
       String app = 'dpg_idle_$pid';
       PgNativePool pool = openPool(
