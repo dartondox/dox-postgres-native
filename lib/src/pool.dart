@@ -469,11 +469,13 @@ class _RowStream {
     _Link.instance.more(_id);
   }
 
-  /// The listener is gone: stop the query. Rust frees the connection.
+  /// The listener is gone: stop the query. Rust frees the connection. In
+  /// a transaction it sends no CancelRequest (soft): the stream ends at
+  /// its next chunk, so a late cancel can not stop the next query.
   void _stop() {
     if (_done || _id < 0) return;
     _done = true;
-    _Link.instance.cancel(_id);
+    _Link.instance.cancel(_id, soft: true);
   }
 
   /// A chunk from Rust, more come.
@@ -615,14 +617,24 @@ class _Link {
   }
 
   /// Cancels request [id]. Not sent yet: it is marked, and Rust does not
-  /// run it. Else a cancel record goes to Rust.
-  void cancel(int id) {
+  /// run it. Else a cancel record goes to Rust. [soft]: see
+  /// [_RowStream._stop].
+  void cancel(int id, {bool soft = false}) {
     int? start = _unsent.remove(id);
     if (start != null) {
       _out[start + 25] |= 2;
       return;
     }
-    _write(id, 0, 0, 5, 0, PgNativePool._noSql, const <Object?>[], 0);
+    _write(
+      id,
+      0,
+      0,
+      5,
+      soft ? 4 : 0,
+      PgNativePool._noSql,
+      const <Object?>[],
+      0,
+    );
     _queueFlush();
   }
 

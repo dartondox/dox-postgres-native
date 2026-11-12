@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:isolate';
 
 import 'package:dox_postgres_native/dox_postgres_native.dart';
 import 'package:test/test.dart';
@@ -80,6 +81,23 @@ void main() {
       expect((await pool.query('SELECT 1 AS n')).rows.single['n'], 1);
       pool.close();
       await settle(app, 0);
+    });
+
+    test('a timed out query is cancelled on the server', () async {
+      String app = 'dpg_rtc_$pid';
+      PgNativePool pool = openPool(
+        app,
+        requestTimeout: const Duration(seconds: 1),
+      );
+      await expectLater(
+        pool.query('SELECT pg_sleep(8)'),
+        throwsA(isA<PgException>()),
+      );
+      // the backend stops long before the 8 s are over
+      Stopwatch sw = Stopwatch()..start();
+      await settle(app, 0);
+      expect(sw.elapsed, lessThan(const Duration(seconds: 4)));
+      pool.close();
     });
 
     test('a bad duration throws', () {
@@ -217,6 +235,64 @@ void main() {
       expect((await pool.query('SELECT 1 AS n')).rows.single['n'], 1);
     });
 
+    test('works with queries of another isolate on the pool', () async {
+      PgNativePool two = openPool('${app}_iso');
+      Future<int> other = Isolate.run(_plainQueries(two.handle));
+      List<Future<PgNativeResult>> mine = <Future<PgNativeResult>>[
+        for (int i = 0; i < 50; i++) two.query('SELECT pg_sleep(0.001)'),
+      ];
+      PgCancelToken token = PgCancelToken();
+      Future<PgNativeResult> slow = two.query(
+        'SELECT pg_sleep(10)',
+        cancelToken: token,
+      );
+      mine.addAll(<Future<PgNativeResult>>[
+        for (int i = 0; i < 50; i++) two.query('SELECT pg_sleep(0.001)'),
+      ]);
+      await Future<void>.delayed(const Duration(milliseconds: 100));
+      token.cancel();
+      await expectLater(slow, cancelled);
+      // no plain query got the cancel
+      await Future.wait(mine);
+      expect(await other, 200);
+      two.close();
+    });
+
+    test('a token in a transaction of another isolate is refused', () async {
+      PgNativePool two = openPool('${app}_xtx');
+      ReceivePort fromChild = ReceivePort();
+      StreamIterator<Object?> msgs = StreamIterator<Object?>(fromChild);
+      await Isolate.spawn(_beginHere, <Object>[two.handle, fromChild.sendPort]);
+      await msgs.moveNext();
+      SendPort toChild = msgs.current as SendPort;
+      await msgs.moveNext();
+      int tx = msgs.current as int;
+      Matcher refused = throwsA(
+        isA<PgException>().having(
+          (PgException e) => e.message,
+          'message',
+          contains('works only in the isolate that started the transaction'),
+        ),
+      );
+      await expectLater(
+        two.query('SELECT 1', transaction: tx, cancelToken: PgCancelToken()),
+        refused,
+      );
+      await expectLater(
+        two.stream('SELECT 1', transaction: tx).toList(),
+        refused,
+      );
+      // a plain query still works there
+      expect(
+        (await two.query('SELECT 1 AS n', transaction: tx)).rows.single['n'],
+        1,
+      );
+      toChild.send('end');
+      await msgs.moveNext();
+      await msgs.cancel();
+      two.close();
+    });
+
     test('in a transaction, the transaction is aborted', () async {
       int tx = await pool.begin();
       PgCancelToken token = PgCancelToken();
@@ -330,6 +406,53 @@ void main() {
       expect((await pool.query('SELECT 1 AS n')).rows.single['n'], 1);
     });
 
+    test('stop early in a transaction, the next query works', () async {
+      for (int i = 0; i < 100; i++) {
+        int tx = await pool.begin();
+        PgNativeResult first = await pool
+            .stream(
+              'SELECT g FROM generate_series(1, 100000) g',
+              transaction: tx,
+              chunkSize: 10,
+            )
+            .first;
+        expect(first.rows.length, 10);
+        PgNativeResult r = await pool.query('SELECT 1 AS n', transaction: tx);
+        expect(r.rows.single['n'], 1);
+        await pool.rollback(tx);
+      }
+    });
+
+    test('a paused stream fails after requestTimeout', () async {
+      PgNativePool short = openPool(
+        '${app}_pause',
+        max: 1,
+        requestTimeout: const Duration(milliseconds: 300),
+      );
+      int got = 0;
+      List<Object> errors = <Object>[];
+      Completer<void> done = Completer<void>();
+      late StreamSubscription<PgNativeResult> sub;
+      sub = short
+          .stream('SELECT g FROM generate_series(1, 10000) g', chunkSize: 10)
+          .listen(
+            (PgNativeResult r) {
+              got++;
+              if (got == 1) sub.pause();
+            },
+            onError: errors.add,
+            onDone: done.complete,
+          );
+      await Future<void>.delayed(const Duration(seconds: 1));
+      sub.resume();
+      await done.future.timeout(const Duration(seconds: 5));
+      expect(got, lessThanOrEqualTo(2));
+      expect(errors.single.toString(), contains('timeout'));
+      // its connection closed: a new one works
+      expect((await short.query('SELECT 1 AS n')).rows.single['n'], 1);
+      short.close();
+    });
+
     test('errors come as a stream error', () async {
       await expectLater(
         pool
@@ -374,4 +497,31 @@ void main() {
       two.close();
     });
   });
+}
+
+/// runs in another isolate: 200 short queries on the shared pool
+Future<int> _plainRun(int handle) async {
+  PgNativePool pool = PgNativePool.fromHandle(handle);
+  List<PgNativeResult> res = await Future.wait(<Future<PgNativeResult>>[
+    for (int i = 0; i < 200; i++)
+      pool.query(r'SELECT pg_sleep(0.001), $1::int AS n', parameters: <int>[i]),
+  ]);
+  return res.length;
+}
+
+/// a closure with only [handle], so it can go to another isolate
+Future<int> Function() _plainQueries(int handle) =>
+    () => _plainRun(handle);
+
+/// Starts a transaction, sends its id, and stays alive until told.
+Future<void> _beginHere(List<Object> args) async {
+  PgNativePool pool = PgNativePool.fromHandle(args[0] as int);
+  SendPort out = args[1] as SendPort;
+  ReceivePort inbox = ReceivePort();
+  out.send(inbox.sendPort);
+  int tx = await pool.begin();
+  out.send(tx);
+  await inbox.first;
+  await pool.rollback(tx);
+  out.send('bye');
 }

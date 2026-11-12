@@ -289,6 +289,10 @@ struct Wait {
     retry: bool,
     /// Dart cancelled it
     cancelled: bool,
+    /// cancelled with no CancelRequest: a stream in a transaction whose
+    /// listener left. It ends at its next PortalSuspended, so a late
+    /// cancel can not hit the next query of the transaction.
+    quiet: bool,
     /// it has the connection for itself
     solo: bool,
     /// rows per chunk of a stream, else 0
@@ -308,6 +312,7 @@ impl Wait {
             fail: None,
             retry: false,
             cancelled: false,
+            quiet: false,
             solo: false,
             chunk: 0,
             phase: Phase::Running,
@@ -317,6 +322,11 @@ impl Wait {
     /// The server works on it now (a stream: an Execute is out).
     fn running(&self) -> bool {
         self.chunk == 0 || self.phase == Phase::Running
+    }
+
+    /// It needs a CancelRequest: cancelled, not quiet, and it runs.
+    fn wants_cancel(&self) -> bool {
+        self.cancelled && !self.quiet && self.running()
     }
 }
 
@@ -645,8 +655,10 @@ impl Conn {
     /// Cancels request `id` if it is on this connection. False when it is
     /// not here. One that waits for the login is dropped. A running one
     /// gets a CancelRequest (see [Self::cancel_job]). A stream that waits
-    /// for Dart ends with a Sync.
-    pub fn cancel(&mut self, id: u64, ready: &mut Vec<u8>) -> bool {
+    /// for Dart ends with a Sync. `soft` (the listener of a stream left):
+    /// in a transaction no CancelRequest, the stream ends at its next
+    /// PortalSuspended.
+    pub fn cancel(&mut self, id: u64, soft: bool, ready: &mut Vec<u8>) -> bool {
         if let Some(i) = self.pre.iter().position(|p| p.id == id) {
             self.pre.remove(i);
             record(ready, id, CANCELLED, &[]);
@@ -656,6 +668,7 @@ impl Conn {
             return false;
         };
         w.cancelled = true;
+        w.quiet |= soft && self.tx.is_some();
         if w.chunk > 0 && w.phase == Phase::Suspended {
             w.phase = Phase::Syncing;
             frontend::sync(&mut self.out);
@@ -689,35 +702,65 @@ impl Conn {
     /// cancelled it. Sent again every [CANCEL_AGAIN] while it still runs.
     pub fn cancel_job(&mut self, now: Instant) -> Option<CancelJob> {
         let runs = matches!(self.state, State::Ready)
-            && self
-                .waits
-                .front()
-                .is_some_and(|w| w.cancelled && w.running());
-        if let Some((done, at)) = &self.cancel {
-            if !done.load(Ordering::Acquire) {
-                return None;
-            }
-            if !runs {
-                self.cancel = None;
-                return None;
-            }
-            if *at + CANCEL_AGAIN > now {
-                return None;
-            }
-        }
-        let (pid, secret) = self.key?;
+            && self.waits.front().is_some_and(Wait::wants_cancel);
         if !runs {
             return None;
         }
-        let done = Arc::new(AtomicBool::new(false));
-        self.cancel = Some((done.clone(), now));
+        if let Some((done, at)) = &self.cancel
+            && (!done.load(Ordering::Acquire) || *at + CANCEL_AGAIN > now)
+        {
+            return None;
+        }
+        let job = self.job()?;
+        self.cancel = Some((job.done.clone(), now));
+        Some(job)
+    }
+
+    /// The last CancelRequest is done and nothing needs another one: the
+    /// connection takes requests again, the ones in `pre` go now.
+    pub fn settle_cancel(&mut self, ready: &mut Vec<u8>) {
+        let Some((done, _)) = &self.cancel else {
+            return;
+        };
+        if !done.load(Ordering::Acquire) || self.waits.front().is_some_and(Wait::wants_cancel) {
+            return;
+        }
+        self.cancel = None;
+        self.send_pre(ready);
+    }
+
+    /// A CancelRequest for the first request, when it runs on the server:
+    /// for a request that timed out, before its connection closes. Else
+    /// it would run on until it ends.
+    pub fn timeout_job(&self) -> Option<CancelJob> {
+        let runs =
+            matches!(self.state, State::Ready) && self.waits.front().is_some_and(Wait::running);
+        if runs { self.job() } else { None }
+    }
+
+    fn job(&self) -> Option<CancelJob> {
+        let (pid, secret) = self.key?;
         Some(CancelJob {
             addr: self.addrs.get(self.next_addr.wrapping_sub(1))?.clone(),
             pid,
             secret,
             wait: self.pool.cfg.connect_timeout.unwrap_or(CANCEL_WAIT),
-            done,
+            done: Arc::new(AtomicBool::new(false)),
         })
+    }
+
+    /// Sends the requests that wait in `pre`, when nothing holds them:
+    /// the login, a stream, or a CancelRequest on the way.
+    fn send_pre(&mut self, ready: &mut Vec<u8>) {
+        if matches!(self.state, State::Ready)
+            && !self.pre.is_empty()
+            && !self.streaming()
+            && !self.held()
+        {
+            for p in std::mem::take(&mut self.pre) {
+                self.send(p, ready);
+            }
+        }
     }
 
     fn need_write(&self) -> bool {
@@ -734,9 +777,7 @@ impl Conn {
         let to = self.pool.timeout();
         // only after the last one is done: the thread nudges the link then
         let again = match (&self.cancel, self.waits.front()) {
-            (Some((done, at)), Some(w))
-                if w.cancelled && w.running() && done.load(Ordering::Acquire) =>
-            {
+            (Some((done, at)), Some(w)) if w.wants_cancel() && done.load(Ordering::Acquire) => {
                 Some(*at + CANCEL_AGAIN)
             }
             _ => None,
@@ -798,9 +839,14 @@ impl Conn {
     }
 
     /// Takes a request. It is written to `out` now, or after the login,
-    /// or after the stream that runs on this connection.
+    /// after the stream that runs on this connection, or after the
+    /// CancelRequest on the way (it must not stop this one).
     pub fn send(&mut self, p: Pending, ready: &mut Vec<u8>) {
-        if !matches!(self.state, State::Ready) || !self.pre.is_empty() || self.streaming() {
+        if !matches!(self.state, State::Ready)
+            || !self.pre.is_empty()
+            || self.streaming()
+            || self.held()
+        {
             self.pre.push(p);
             return;
         }
@@ -1254,11 +1300,7 @@ impl Conn {
             }
         }
         // a stream ended: the requests that waited behind it go now
-        if matches!(self.state, State::Ready) && !self.pre.is_empty() && !self.streaming() {
-            for p in std::mem::take(&mut self.pre) {
-                self.send(p, ready);
-            }
-        }
+        self.send_pre(ready);
         Ok(())
     }
 

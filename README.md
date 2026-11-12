@@ -88,7 +88,7 @@ PgNativePool pool = PgNativePool.open(
 );
 ```
 
-- `requestTimeout` (default 300 s): the longest wait for one request (a free connection, the connect and the query). Over it, the request fails with a `PgException` that says `timeout`, and its connection is closed. A transaction with no request for this long is rolled back.
+- `requestTimeout` (default 300 s): the longest wait for one request (a free connection, the connect and the query). Over it, the request fails with a `PgException` that says `timeout`. A CancelRequest stops the query on the server, and its connection is closed. A transaction with no request for this long is rolled back.
 - `maxConnectionAge` (default: no limit): a connection older than this is closed when it is next free. It is never closed while a query or a transaction uses it. A new one opens when it is needed. Useful behind a load balancer, or to follow a DNS change after a failover.
 - `idleTimeout` (default: kept): a free connection that is not used for this long is closed. A new one opens when it is needed.
 
@@ -113,6 +113,7 @@ try {
 - A query with a token gets a connection for itself, so the cancel can not stop another query.
 - In a transaction, a cancelled query is an error, so Postgres aborts the transaction. Roll it back.
 - One token can stop many queries. Use it in the isolate that made it.
+- A transaction started in another isolate does not take a query with a token. It throws a `PgException`.
 - The CancelRequest goes in plain text on a new connection, like libpq before Postgres 17.
 
 ## Stream rows
@@ -132,7 +133,7 @@ await for (PgNativeResult chunk in pool.stream(
 ```
 
 - The query runs on a server-side portal. The driver asks the server for the next chunk only when your listener is ready for it. So only about two chunks are in memory, also for millions of rows.
-- The query starts when you listen. Stop listening (eg. `break` in `await for`) to stop it. Its connection is free again.
+- The query starts when you listen. Stop listening (eg. `break` in `await for`, or `.first`) to stop it. Its connection is free again. In a transaction, the stream then ends after the chunk that runs now, with no CancelRequest, so the next query of the transaction is safe.
 - `cancelToken` stops it too. Then the stream fails with `PgQueryCancelledException`.
 - An error (eg. a `PgServerException`) comes as a stream error, then the stream ends.
 - It holds one connection until it ends. A paused listener that waits longer than `requestTimeout` fails the stream with a timeout.

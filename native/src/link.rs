@@ -80,8 +80,8 @@ use mio::{Events, Poll, Registry, Token, Waker};
 
 use crate::conn::{CancelJob, Conn, Job, Pending};
 use crate::{
-    Addr, DROPPED, Fail, INTERNAL, Pool, RES_HEAD, Request, fail, parse, pool, post, rd32, rd64,
-    record, refresh,
+    Addr, DROPPED, Fail, INTERNAL, Pool, RES_HEAD, Request, SOFT, fail, parse, pool, post, rd32,
+    rd64, record, refresh,
 };
 
 /// How often the helper checks that the isolate is alive.
@@ -122,6 +122,7 @@ fn send_cancel(job: CancelJob, link: Weak<Link>) {
     } = job;
     let mut msg = bytes::BytesMut::new();
     postgres_protocol::message::frontend::cancel_request(pid, secret, &mut msg);
+    let (done_ok, link_ok) = (done.clone(), link.clone());
     let run = move || {
         use std::io::{Read, Write};
         fn talk(mut s: impl Read + Write, msg: &[u8]) {
@@ -152,12 +153,17 @@ fn send_cancel(job: CancelJob, link: Weak<Link>) {
             l.nudge();
         }
     };
-    if let Err(e) = std::thread::Builder::new()
+    if std::thread::Builder::new()
         .name("dox-pg-cancel".into())
         .spawn(run)
+        .is_err()
     {
-        // no thread: the cancel is lost, the query runs to its end
-        drop(e);
+        // no thread: the cancel is lost, the query runs to its end. The
+        // connection must not wait for it forever.
+        done_ok.store(true, Ordering::Release);
+        if let Some(l) = link_ok.upgrade() {
+            l.nudge();
+        }
     }
 }
 
@@ -387,7 +393,7 @@ impl Core {
         while let Some(req) = parse(b, &mut p) {
             match req.kind {
                 5 => {
-                    self.cancel(req.id);
+                    self.cancel(req.id, req.flags & SOFT != 0);
                     continue;
                 }
                 6 => {
@@ -447,9 +453,12 @@ impl Core {
     fn forward(&mut self, req: Request) {
         let id = req.id;
         let owner = req.tx >> 32;
-        // ponytail: its next-chunk requests would need forwarding too
-        if req.kind == 4 && owner != self.id {
-            let f = Fail::text("a stream works only in the isolate that started the transaction");
+        // ponytail: its cancel and next-chunk requests would need
+        // forwarding too
+        if req.solo() && owner != self.id {
+            let f = Fail::text(
+                "a stream or a query with a cancel token works only in the isolate that started the transaction",
+            );
             return fail(&mut self.ready, id, &f);
         }
         if owner != self.id
@@ -563,7 +572,11 @@ impl Core {
         // the others drain and go to the pool.
         if pick.is_none() && !begin {
             pick = if others {
-                l.pile
+                l.pile.filter(|&i| {
+                    conns[i]
+                        .as_ref()
+                        .is_some_and(|c| c.tx.is_none() && !c.exclusive())
+                })
             } else {
                 l.conns
                     .iter()
@@ -750,6 +763,10 @@ impl Core {
             if let Some(c) = c
                 && let Err(f) = c.expire(now, &mut self.ready)
             {
+                // stop the query on the server too, before the close
+                if let Some(job) = c.timeout_job() {
+                    send_cancel(job, Weak::new());
+                }
                 broken.push((i, f));
             } else if let Some(c) = c
                 && c.idle()
@@ -774,7 +791,7 @@ impl Core {
     /// Cancels request `id`: one that waits for a connection is dropped,
     /// one on a connection is cancelled there. Not found (eg. it has its
     /// answer already): nothing to do.
-    fn cancel(&mut self, id: u64) {
+    fn cancel(&mut self, id: u64, soft: bool) {
         for l in self.pools.values_mut() {
             if let Some(i) = l.queue.iter().position(|p| p.id == id) {
                 l.queue.remove(i);
@@ -782,7 +799,7 @@ impl Core {
             }
         }
         for c in self.conns.iter_mut().flatten() {
-            if c.cancel(id, &mut self.ready) {
+            if c.cancel(id, soft, &mut self.ready) {
                 return;
             }
         }
@@ -793,6 +810,16 @@ impl Core {
         for c in self.conns.iter_mut().flatten() {
             if c.more(id, now) {
                 return;
+            }
+        }
+    }
+
+    /// Frees the connections whose CancelRequest is done: the requests
+    /// that waited for it go now.
+    fn settle_cancels(&mut self) {
+        for c in self.conns.iter_mut().flatten() {
+            if c.cancelling() {
+                c.settle_cancel(&mut self.ready);
             }
         }
     }
@@ -829,6 +856,7 @@ impl Core {
         }
         self.share();
         self.wait_turns();
+        self.settle_cancels();
         self.flush_all();
         // after the flush: the query is on its way before its cancel
         self.cancels();

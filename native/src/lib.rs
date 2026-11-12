@@ -32,7 +32,8 @@
 //! param: u32 type oid (0: let the server pick), u8 format (0 text, 1
 //! binary), i32 length (-1: NULL), bytes. A stream (kind 4) ends with a
 //! u32: the rows per chunk. Cancel (5) and next chunk (6) carry the id of
-//! the request they are for, and get no result record of their own.
+//! the request they are for, and get no result record of their own. A
+//! cancel may have the flag [SOFT].
 //!
 //! Result record (13 byte head): u64 id, u8 status, u32 body length.
 //! - status 0 (rows): u16 column count, per column u32 type oid, u16 name
@@ -74,6 +75,9 @@ const CACHE_MAX: usize = 512;
 const SOLO: u8 = 1;
 /// Request flag: Dart cancelled it before it was sent. It is not run.
 const DROPPED: u8 = 2;
+/// Cancel flag: the listener of a stream left. In a transaction the
+/// stream ends at its next chunk, with no CancelRequest.
+const SOFT: u8 = 4;
 
 // ---- Dart API DL -------------------------------------------------------
 // `NativeApi.initializeApiDLData` points to this table. We only need
