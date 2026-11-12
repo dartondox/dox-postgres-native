@@ -72,6 +72,72 @@ PgNativePool pool = PgNativePool.fromUrl(
 );
 ```
 
+## Pool settings
+
+All are optional. The defaults keep connections open and wait up to 300 s.
+
+```dart
+PgNativePool pool = PgNativePool.open(
+  host: 'localhost',
+  user: 'postgres',
+  password: 'postgres',
+  database: 'postgres',
+  requestTimeout: const Duration(seconds: 30),
+  maxConnectionAge: const Duration(minutes: 30),
+  idleTimeout: const Duration(minutes: 5),
+);
+```
+
+- `requestTimeout` (default 300 s): the longest wait for one request (a free connection, the connect and the query). Over it, the request fails with a `PgException` that says `timeout`, and its connection is closed. A transaction with no request for this long is rolled back.
+- `maxConnectionAge` (default: no limit): a connection older than this is closed when it is next free. It is never closed while a query or a transaction uses it. A new one opens when it is needed. Useful behind a load balancer, or to follow a DNS change after a failover.
+- `idleTimeout` (default: kept): a free connection that is not used for this long is closed. A new one opens when it is needed.
+
+`fromUrl` takes the same three. Isolates share one pool only when all settings are the same.
+
+## Cancel a query
+
+```dart
+PgCancelToken token = PgCancelToken();
+Future<PgNativeResult> slow = pool.query('SELECT pg_sleep(60)', cancelToken: token);
+token.cancel();
+try {
+  await slow;
+} on PgQueryCancelledException {
+  print('stopped');
+}
+```
+
+- Cancel before the query starts: it does not run.
+- Cancel while it runs: the driver sends a Postgres CancelRequest for it, and the future fails with `PgQueryCancelledException`.
+- Cancel after it ended: nothing happens. You keep the result.
+- A query with a token gets a connection for itself, so the cancel can not stop another query.
+- In a transaction, a cancelled query is an error, so Postgres aborts the transaction. Roll it back.
+- One token can stop many queries. Use it in the isolate that made it.
+- The CancelRequest goes in plain text on a new connection, like libpq before Postgres 17.
+
+## Stream rows
+
+For a big result, `stream` gives the rows in chunks. Each chunk is a `PgNativeResult` with up to `chunkSize` rows (default 1000).
+
+```dart
+await for (PgNativeResult chunk in pool.stream(
+  'SELECT * FROM events WHERE day = @day',
+  parameters: <String, dynamic>{'day': '2026-01-01'},
+  chunkSize: 500,
+)) {
+  for (Map<String, dynamic> row in chunk.rows) {
+    // ...
+  }
+}
+```
+
+- The query runs on a server-side portal. The driver asks the server for the next chunk only when your listener is ready for it. So only about two chunks are in memory, also for millions of rows.
+- The query starts when you listen. Stop listening (eg. `break` in `await for`) to stop it. Its connection is free again.
+- `cancelToken` stops it too. Then the stream fails with `PgQueryCancelledException`.
+- An error (eg. a `PgServerException`) comes as a stream error, then the stream ends.
+- It holds one connection until it ends. A paused listener that waits longer than `requestTimeout` fails the stream with a timeout.
+- It works in a transaction (`transaction: tx`). Other queries of that transaction wait until the stream ends. The stream works only in the isolate that started the transaction.
+
 ## Parameter values
 
 `null`, `bool`, `int`, `double`, `String`, `DateTime`, `Duration` (an interval), `Uint8List` (bytea), `Map` (json) and `List` (an array, eg. for `int4[]`).
@@ -93,6 +159,7 @@ try {
 
 - `PgServerException`: the server said no. It has `code` (SQLSTATE), `severity`, `message`, and `detail`, `hint`, `schema`, `table`, `column`, `constraint` when the server sends them.
 - `PgException`: everything else, eg. no connection, a TLS error, a timeout.
+- `PgQueryCancelledException` (a `PgException`): the query was stopped with a `PgCancelToken`.
 
 ## TLS
 
@@ -144,6 +211,9 @@ If the app still opens a pool, it throws an error that says the library is not i
 - Many queries go to Rust in one call. Many results come back in one call.
 - Each connection keeps its prepared statements.
 - Transactions: `pool.begin()`, `pool.commit(tx)`, `pool.rollback(tx)`.
+- Row streaming in chunks, with backpressure: `pool.stream(sql)`.
+- Query cancel: `PgCancelToken`.
+- Pool settings: `requestTimeout`, `maxConnectionAge`, `idleTimeout`.
 - Parameters as a map for `@name`, or a list for `$1, $2`.
 - TLS with rustls.
 

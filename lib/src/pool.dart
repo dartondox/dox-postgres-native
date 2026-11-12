@@ -22,6 +22,38 @@ class PgNativeResult {
   final List<Map<String, dynamic>> rows;
 }
 
+/// Stops a running query or stream. Give it as `cancelToken` to
+/// [PgNativePool.query] or [PgNativePool.stream], then call [cancel].
+///
+/// - Before the query starts: it does not run.
+/// - While it runs: the driver sends a Postgres CancelRequest for it. Its
+///   future (or stream) fails with [PgQueryCancelledException].
+/// - After it ended: nothing happens, you keep its result.
+///
+/// A query with a token gets a connection for itself, so the cancel can
+/// not stop another query. Inside a transaction, a cancelled query is an
+/// error, so Postgres aborts the transaction: roll it back. One token can
+/// stop many queries. Use it in the isolate that made it.
+class PgCancelToken {
+  bool _cancelled = false;
+
+  /// the requests of this token that wait for their answer
+  final Set<int> _ids = <int>{};
+
+  /// true after [cancel]
+  bool get isCancelled => _cancelled;
+
+  /// Cancels the queries of this token. Calling it again does nothing.
+  void cancel() {
+    if (_cancelled) return;
+    _cancelled = true;
+    for (int id in _ids) {
+      _Link.instance.cancel(id);
+    }
+    _ids.clear();
+  }
+}
+
 /// A pool of Postgres connections, owned by Rust. The Postgres work of
 /// each isolate runs on its own thread, with no extra runtime thread.
 ///
@@ -54,12 +86,23 @@ class PgNativePool {
     int transaction,
     int kind,
     Uint8List sql,
-    List<Object?> values,
-  ) {
+    List<Object?> values, [
+    PgCancelToken? token,
+  ]) {
     if (_closed) {
       return Future<T>.error(StateError('PgNativePool is closed'));
     }
-    return _Link.instance.send<T>(handle, transaction, kind, sql, values);
+    if (token != null && token.isCancelled) {
+      return Future<T>.error(PgQueryCancelledException());
+    }
+    return _Link.instance.send<T>(
+      handle,
+      transaction,
+      kind,
+      sql,
+      values,
+      token,
+    );
   }
 
   static bool? _available;
@@ -118,6 +161,23 @@ class PgNativePool {
   /// Mozilla roots and the roots of the system. `prefer` and `require` do
   /// not use it. A file that is missing or has no valid certificate throws
   /// [PgException].
+  ///
+  /// [requestTimeout] is the longest wait for one request: a free
+  /// connection, the connect and the query. Over it the request fails with
+  /// a timeout [PgException], and its connection is closed. A transaction
+  /// with no request for this long is rolled back. A stream that waits
+  /// this long for its listener (paused) fails the same way.
+  ///
+  /// [maxConnectionAge]: a connection older than this is closed when it is
+  /// next free, never while a query or transaction uses it. A new one opens
+  /// when it is needed. Null (the default): no limit. Useful behind a load
+  /// balancer, or to pick up new DNS after a failover.
+  ///
+  /// [idleTimeout]: a free connection that is not used for this long is
+  /// closed. A new one opens when it is needed. Null (the default): free
+  /// connections stay open.
+  ///
+  /// Pools are shared only when all these settings are the same.
   factory PgNativePool.open({
     String host = 'localhost',
     int port = 5432,
@@ -130,7 +190,19 @@ class PgNativePool {
     int threads = 1,
     String sslMode = 'disable',
     String? sslRootCert,
+    Duration requestTimeout = const Duration(seconds: 300),
+    Duration? maxConnectionAge,
+    Duration? idleTimeout,
   }) {
+    for (MapEntry<String, Duration?> e in <String, Duration?>{
+      'requestTimeout': requestTimeout,
+      'maxConnectionAge': maxConnectionAge,
+      'idleTimeout': idleTimeout,
+    }.entries) {
+      if (e.value != null && e.value!.inMilliseconds < 1) {
+        throw ArgumentError.value(e.value, e.key, 'Must be at least 1 ms');
+      }
+    }
     // Rust knows disable, prefer and require. verify-ca and verify-full
     // are require with the certificate check on.
     String? mode = const <String, String>{
@@ -174,6 +246,9 @@ class PgNativePool {
       bytes.length,
       maxConnections,
       const <String, int>{'verify-full': 1, 'verify-ca': 2}[sslMode] ?? 0,
+      requestTimeout.inMilliseconds,
+      maxConnectionAge?.inMilliseconds ?? 0,
+      idleTimeout?.inMilliseconds ?? 0,
       rootCert.address,
       rootCert.length,
       error.address,
@@ -203,6 +278,9 @@ class PgNativePool {
     int maxConnections = 10,
     String timeZone = 'UTC',
     int threads = 1,
+    Duration requestTimeout = const Duration(seconds: 300),
+    Duration? maxConnectionAge,
+    Duration? idleTimeout,
   }) {
     Uri uri = Uri.parse(url);
     if (uri.scheme != 'postgres' && uri.scheme != 'postgresql') {
@@ -227,6 +305,9 @@ class PgNativePool {
       threads: threads,
       sslMode: q['sslmode'] ?? 'disable',
       sslRootCert: q['sslrootcert'],
+      requestTimeout: requestTimeout,
+      maxConnectionAge: maxConnectionAge,
+      idleTimeout: idleTimeout,
     );
   }
 
@@ -245,16 +326,66 @@ class PgNativePool {
   ///
   /// Throws [PgServerException] for errors from the server (eg. code
   /// `23505` for a unique violation), [PgException] for others.
+  ///
+  /// [cancelToken] can stop the query (see [PgCancelToken]). Then it
+  /// throws [PgQueryCancelledException].
   Future<PgNativeResult> query(
     String sql, {
     Object? parameters,
     int transaction = 0,
+    PgCancelToken? cancelToken,
   }) {
     ParsedSql parsed = parameters is List
         ? ParsedSql.direct(sql)
         : ParsedSql.named(sql);
     List<Object?> values = parsed.bind(parameters);
-    return _send<PgNativeResult>(transaction, 0, parsed.sql, values);
+    return _send<PgNativeResult>(
+      transaction,
+      0,
+      parsed.sql,
+      values,
+      cancelToken,
+    );
+  }
+
+  /// Runs [sql] and gives its rows in chunks of up to [chunkSize] rows.
+  /// Each chunk has the same columns and row maps as [query]. Use it for a
+  /// big result: only about two chunks are in memory at a time.
+  ///
+  /// The query runs on a server-side portal. The next chunk is read from
+  /// the server only when the listener is ready for it, so a slow (or
+  /// paused) listener makes the server wait.
+  ///
+  /// The query starts when you listen. Cancel the subscription to stop it:
+  /// its connection is free again. [cancelToken] stops it too: then the
+  /// stream fails with [PgQueryCancelledException]. Errors (eg.
+  /// [PgServerException]) come as a stream error, then the stream ends.
+  ///
+  /// It holds one connection until it ends. In a [transaction], other
+  /// queries of the same transaction wait until the stream ends, and the
+  /// stream works only in the isolate that started the transaction.
+  Stream<PgNativeResult> stream(
+    String sql, {
+    Object? parameters,
+    int transaction = 0,
+    int chunkSize = 1000,
+    PgCancelToken? cancelToken,
+  }) {
+    if (chunkSize < 1 || chunkSize > 0x7fffffff) {
+      throw ArgumentError.value(chunkSize, 'chunkSize', 'Must be at least 1');
+    }
+    ParsedSql parsed = parameters is List
+        ? ParsedSql.direct(sql)
+        : ParsedSql.named(sql);
+    List<Object?> values = parsed.bind(parameters);
+    return _RowStream(
+      this,
+      transaction,
+      parsed.sql,
+      values,
+      chunkSize,
+      cancelToken,
+    ).controller.stream;
   }
 
   /// Starts a transaction on one connection. Use its id as `transaction`
@@ -284,6 +415,94 @@ class PgNativePool {
   }
 }
 
+/// One stream of [PgNativePool.stream]. It asks Rust for the next chunk
+/// only when the listener is ready for it, so at most about two chunks
+/// are in memory: one with the listener, one on the way.
+class _RowStream {
+  _RowStream(
+    this._pool,
+    this._tx,
+    this._sql,
+    this._values,
+    this._chunk,
+    this._token,
+  ) {
+    controller = StreamController<PgNativeResult>(
+      onListen: _start,
+      onResume: _resume,
+      onCancel: _stop,
+    );
+  }
+
+  final PgNativePool _pool;
+  final int _tx;
+  final Uint8List _sql;
+  final List<Object?> _values;
+  final int _chunk;
+  final PgCancelToken? _token;
+  late final StreamController<PgNativeResult> controller;
+
+  /// the request id in the link, -1 before the start
+  int _id = -1;
+
+  /// the stream is closed (Rust may still send its last record)
+  bool _done = false;
+
+  /// a chunk came while the listener was paused: ask on resume
+  bool _wantMore = false;
+
+  void _start() {
+    if (_pool._closed) return fail(StateError('PgNativePool is closed'));
+    if (_token?.isCancelled ?? false) return fail(PgQueryCancelledException());
+    try {
+      _id = _Link.instance.open(this, _pool.handle, _tx, _sql, _values, _chunk);
+    } catch (error, stack) {
+      fail(error, stack);
+      return;
+    }
+    _token?._ids.add(_id);
+  }
+
+  void _resume() {
+    if (!_wantMore || _done) return;
+    _wantMore = false;
+    _Link.instance.more(_id);
+  }
+
+  /// The listener is gone: stop the query. Rust frees the connection.
+  void _stop() {
+    if (_done || _id < 0) return;
+    _done = true;
+    _Link.instance.cancel(_id);
+  }
+
+  /// A chunk from Rust, more come.
+  void chunk(PgNativeResult r) {
+    if (_done) return;
+    controller.add(r);
+    if (controller.isPaused) {
+      _wantMore = true;
+    } else {
+      _Link.instance.more(_id);
+    }
+  }
+
+  /// The last chunk from Rust.
+  void end(PgNativeResult r) {
+    if (_done) return;
+    _done = true;
+    if (r.rows.isNotEmpty) controller.add(r);
+    controller.close();
+  }
+
+  void fail(Object error, [StackTrace? stack]) {
+    if (_done) return;
+    _done = true;
+    controller.addError(error, stack);
+    controller.close();
+  }
+}
+
 /// The link of this isolate to Rust: one link in Rust (its sockets), and
 /// one buffer for the requests that go out in the next microtask.
 class _Link {
@@ -306,14 +525,22 @@ class _Link {
   /// the results, written by Rust
   Uint8List _in = Uint8List(1 << 16);
 
-  /// The waiting requests. The id of a request is its slot here. Rust
-  /// answers each id once, so a slot is free again after its answer.
-  final List<Completer<Object?>?> _pending = <Completer<Object?>?>[];
+  /// The waiting requests: a `Completer`, or a [_RowStream]. The id of a
+  /// request is its slot here. Rust answers each id once (a stream: its
+  /// chunks, then one last record), so a slot is free again after that.
+  final List<Object?> _pending = <Object?>[];
 
   /// the sql of each waiting request, to find the columns it had before
   final List<Uint8List> _sqls = <Uint8List>[];
+
+  /// the cancel token of each waiting request, or null
+  final List<PgCancelToken?> _tokens = <PgCancelToken?>[];
   final List<int> _free = <int>[];
   int _waiting = 0;
+
+  /// where the record of a request with a cancel token starts in [_out],
+  /// until the next flush. A cancel before the flush marks it there.
+  final Map<int, int> _unsent = <int, int>{};
 
   Uint8List _out = Uint8List(1 << 14);
   late ByteData _outData = ByteData.sublistView(_out);
@@ -326,25 +553,96 @@ class _Link {
     int kind,
     Uint8List sql,
     List<Object?> values,
+    PgCancelToken? token,
+  ) {
+    Completer<T> done = Completer<T>();
+    int id = _add(done, pool, tx, kind, sql, values, token != null, 0);
+    if (token != null) {
+      token._ids.add(id);
+      _tokens[id] = token;
+    }
+    return done.future;
+  }
+
+  /// Starts stream [s]. Gives back its request id.
+  int open(
+    _RowStream s,
+    int pool,
+    int tx,
+    Uint8List sql,
+    List<Object?> values,
+    int chunk,
+  ) {
+    int id = _add(s, pool, tx, 4, sql, values, true, chunk);
+    _tokens[id] = s._token;
+    return id;
+  }
+
+  int _add(
+    Object slot,
+    int pool,
+    int tx,
+    int kind,
+    Uint8List sql,
+    List<Object?> values,
+    bool solo,
+    int chunk,
   ) {
     int id = _free.isEmpty ? _pending.length : _free.last;
-    Completer<T> done = Completer<T>();
+    int start = _len;
     // encode first: a bad value throws before anything is queued
-    _write(id, pool, tx, kind, sql, values);
+    _write(id, pool, tx, kind, solo ? 1 : 0, sql, values, chunk);
+    if (solo) _unsent[id] = start;
     if (id == _pending.length) {
-      _pending.add(done);
+      _pending.add(slot);
       _sqls.add(sql);
+      _tokens.add(null);
     } else {
       _free.removeLast();
-      _pending[id] = done;
+      _pending[id] = slot;
       _sqls[id] = sql;
     }
     if (_waiting++ == 0) _port.keepIsolateAlive = true;
+    _queueFlush();
+    return id;
+  }
+
+  void _queueFlush() {
     if (!_flushQueued) {
       _flushQueued = true;
       scheduleMicrotask(_flush);
     }
-    return done.future;
+  }
+
+  /// Cancels request [id]. Not sent yet: it is marked, and Rust does not
+  /// run it. Else a cancel record goes to Rust.
+  void cancel(int id) {
+    int? start = _unsent.remove(id);
+    if (start != null) {
+      _out[start + 25] |= 2;
+      return;
+    }
+    _write(id, 0, 0, 5, 0, PgNativePool._noSql, const <Object?>[], 0);
+    _queueFlush();
+  }
+
+  /// Asks Rust for the next chunk of stream [id].
+  void more(int id) {
+    _write(id, 0, 0, 6, 0, PgNativePool._noSql, const <Object?>[], 0);
+    _queueFlush();
+  }
+
+  /// Frees the slot of request [id].
+  void _release(int id) {
+    _pending[id] = null;
+    _sqls[id] = PgNativePool._noSql;
+    PgCancelToken? token = _tokens[id];
+    if (token != null) {
+      token._ids.remove(id);
+      _tokens[id] = null;
+    }
+    _free.add(id);
+    _waiting--;
   }
 
   void _ensure(int extra) {
@@ -369,8 +667,10 @@ class _Link {
     int pool,
     int tx,
     int kind,
+    int flags,
     Uint8List sql,
     List<Object?> values,
+    int chunk,
   ) {
     int start = _len;
     _ensure(32);
@@ -379,7 +679,7 @@ class _Link {
     d.setUint64(start + 8, pool, Endian.little);
     d.setUint64(start + 16, tx, Endian.little);
     d.setUint8(start + 24, kind);
-    d.setUint8(start + 25, 0);
+    d.setUint8(start + 25, flags);
     d.setUint16(start + 26, values.length, Endian.little);
     d.setUint32(start + 28, sql.length, Endian.little);
     _len += 32;
@@ -403,6 +703,11 @@ class _Link {
         }
         _outData.setUint32(at, oid, Endian.little);
         _outData.setUint8(at + 4, oid == 17 ? 1 : 0);
+      }
+      if (kind == 4) {
+        _ensure(4);
+        _outData.setUint32(_len, chunk, Endian.little);
+        _len += 4;
       }
     } catch (_) {
       _len = start; // a bad value: nothing of this request is sent
@@ -495,6 +800,7 @@ class _Link {
     // some results are ready at once (eg. an error): read them soon
     if (dpgSubmit(_link, _out.address, _len) != 0) scheduleMicrotask(_run);
     _len = 0;
+    _unsent.clear();
     if (_out.length > 1 << 20) {
       _out = Uint8List(1 << 14); // do not keep a big buffer forever
       _outData = ByteData.sublistView(_out);
@@ -535,13 +841,15 @@ class _Link {
       int len = d.getUint32(p + 9, Endian.little);
       int at = p + 13;
       p = at + len;
-      Completer<Object?>? done = id < _pending.length ? _pending[id] : null;
-      if (done == null) continue;
-      _pending[id] = null;
+      Object? slot = id < _pending.length ? _pending[id] : null;
+      if (slot == null) continue;
       Uint8List sql = _sqls[id];
-      _sqls[id] = PgNativePool._noSql;
-      _free.add(id);
-      _waiting--;
+      if (slot is _RowStream) {
+        _onStream(slot, id, status, b, d, at, p, sql);
+        continue;
+      }
+      Completer<Object?> done = slot as Completer<Object?>;
+      _release(id);
       // one bad record fails its own request, not the rest of the batch
       try {
         switch (status) {
@@ -553,6 +861,8 @@ class _Link {
             done.completeError(
               PgException(utf8.decode(Uint8List.sublistView(b, at, p))),
             );
+          case 5:
+            done.completeError(PgQueryCancelledException());
           default:
             done.complete(d.getUint64(at, Endian.little));
         }
@@ -564,6 +874,42 @@ class _Link {
       }
     }
     if (_waiting == 0) _port.keepIsolateAlive = false;
+  }
+
+  /// A record for stream [s]: status 4 is a chunk (more come), any other
+  /// ends it.
+  void _onStream(
+    _RowStream s,
+    int id,
+    int status,
+    Uint8List b,
+    ByteData d,
+    int at,
+    int end,
+    Uint8List sql,
+  ) {
+    if (status != 4) _release(id);
+    try {
+      switch (status) {
+        case 4:
+          s.chunk(_rows(b, d, at, sql));
+        case 0:
+          s.end(_rows(b, d, at, sql));
+        case 1:
+          s.fail(PgServerException.fromFields(_fields(b, d, at)));
+        case 5:
+          s.fail(PgQueryCancelledException());
+        default:
+          s.fail(PgException(utf8.decode(Uint8List.sublistView(b, at, end))));
+      }
+    } catch (error, stack) {
+      s.fail(
+        PgException('dox_postgres_native: can not read the result: $error'),
+        stack,
+      );
+      // stop the query; its last record frees the slot
+      if (status == 4) cancel(id);
+    }
   }
 
   static Map<int, String> _fields(Uint8List b, ByteData d, int at) {

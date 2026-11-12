@@ -38,7 +38,16 @@
 //! Transactions: `begin` takes an idle connection (or a new one) for
 //! itself. Its queries go to that connection in order. After commit or
 //! rollback the connection is a normal one again. A transaction with no
-//! request for the timeout (300 s) is rolled back.
+//! request for the request timeout of the pool (300 s by default) is
+//! rolled back.
+//!
+//! A request that can be cancelled, and a stream, also take an idle
+//! connection (or a new one) for themselves, so no other query is
+//! pipelined behind them. A cancel (kind 5) drops a request that still
+//! waits. For a running one, a small thread sends the CancelRequest on a
+//! new socket (`send_cancel`), and nudges the link when the server closed
+//! it. Free connections that are too old or idle too long (pool settings)
+//! are closed by the timers.
 //!
 //! A transaction id is (link id << 32) | number. So a request for a
 //! transaction from another isolate finds the link that owns it: it goes
@@ -69,10 +78,10 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use mio::{Events, Poll, Registry, Token, Waker};
 
-use crate::conn::{Conn, Job, Pending};
+use crate::conn::{CancelJob, Conn, Job, Pending};
 use crate::{
-    Fail, INTERNAL, Pool, RES_HEAD, Request, TIMED_OUT, fail, parse, pool, post, rd32, rd64,
-    refresh,
+    Addr, DROPPED, Fail, INTERNAL, Pool, RES_HEAD, Request, fail, parse, pool, post, rd32, rd64,
+    record, refresh,
 };
 
 /// How often the helper checks that the isolate is alive.
@@ -96,6 +105,60 @@ fn closed() -> Fail {
 
 fn tx_closed() -> Fail {
     Fail::text("the transaction is closed")
+}
+
+/// Sends a CancelRequest on a new socket, from a small thread: the
+/// isolate never waits for it. Plain text, like libpq before Postgres 17:
+/// the server takes it on any connection. When the server closed the
+/// socket, the backend got the cancel: `done` is set and `link` is nudged,
+/// so its connection takes requests again.
+fn send_cancel(job: CancelJob, link: Weak<Link>) {
+    let CancelJob {
+        addr,
+        pid,
+        secret,
+        wait,
+        done,
+    } = job;
+    let mut msg = bytes::BytesMut::new();
+    postgres_protocol::message::frontend::cancel_request(pid, secret, &mut msg);
+    let run = move || {
+        use std::io::{Read, Write};
+        fn talk(mut s: impl Read + Write, msg: &[u8]) {
+            if s.write_all(msg).is_ok() {
+                // the server closes it when it is done
+                let _ = s.read(&mut [0; 1]);
+            }
+        }
+        match addr {
+            Addr::Tcp(a) => {
+                if let Ok(s) = std::net::TcpStream::connect_timeout(&a, wait) {
+                    let _ = s.set_read_timeout(Some(wait));
+                    let _ = s.set_write_timeout(Some(wait));
+                    talk(s, &msg);
+                }
+            }
+            #[cfg(unix)]
+            Addr::Unix(p) => {
+                if let Ok(s) = std::os::unix::net::UnixStream::connect(p) {
+                    let _ = s.set_read_timeout(Some(wait));
+                    let _ = s.set_write_timeout(Some(wait));
+                    talk(s, &msg);
+                }
+            }
+        }
+        done.store(true, Ordering::Release);
+        if let Some(l) = link.upgrade() {
+            l.nudge();
+        }
+    };
+    if let Err(e) = std::thread::Builder::new()
+        .name("dox-pg-cancel".into())
+        .spawn(run)
+    {
+        // no thread: the cancel is lost, the query runs to its end
+        drop(e);
+    }
 }
 
 /// A request of a transaction of this link, sent by another link.
@@ -219,7 +282,7 @@ fn grow(
         }
         if let Some(mut c) = st.idle.pop() {
             drop(st); // a drop of a dead one takes the lock
-            if !c.alive() {
+            if !c.alive() || c.stale(now) {
                 continue;
             }
             return match adopt(conns, reg, c) {
@@ -322,13 +385,28 @@ impl Core {
         self.check(now);
         let mut p = 0;
         while let Some(req) = parse(b, &mut p) {
+            match req.kind {
+                5 => {
+                    self.cancel(req.id);
+                    continue;
+                }
+                6 => {
+                    self.more(req.id, now);
+                    continue;
+                }
+                _ if req.flags & DROPPED != 0 => {
+                    record(&mut self.ready, req.id, 5, &[]);
+                    continue;
+                }
+                _ => {}
+            }
             if req.tx != 0 {
                 self.in_tx(req, now);
                 continue;
             }
             let (h, id) = (req.pool, req.id);
             let job = match req.kind {
-                0 => Job::Query(req),
+                0 | 4 => Job::Query(req),
                 1 => {
                     self.next_tx += 1;
                     Job::Begin(self.id << 32 | (self.next_tx & 0xffff_ffff))
@@ -354,7 +432,7 @@ impl Core {
         let Some(c) = found else {
             return self.forward(req);
         };
-        let job = if req.kind == 0 {
+        let job = if req.kind == 0 || req.kind == 4 {
             Job::Query(req)
         } else {
             // new requests of this transaction fail from now on
@@ -369,6 +447,11 @@ impl Core {
     fn forward(&mut self, req: Request) {
         let id = req.id;
         let owner = req.tx >> 32;
+        // ponytail: its next-chunk requests would need forwarding too
+        if req.kind == 4 && owner != self.id {
+            let f = Fail::text("a stream works only in the isolate that started the transaction");
+            return fail(&mut self.ready, id, &f);
+        }
         if owner != self.id
             && id & FOREIGN == 0
             && let Some(link) = find(owner)
@@ -451,7 +534,8 @@ impl Core {
             ..
         } = self;
         let l = pools.get_mut(&h).unwrap();
-        let begin = matches!(p.job, Job::Begin(_));
+        // a solo request needs a connection for itself, like a begin
+        let begin = matches!(p.job, Job::Begin(_)) || p.solo();
         let others = l.others_wait();
         // 1. an idle connection of this link. Not while another link
         // waits: then it goes to the pool.
@@ -484,7 +568,11 @@ impl Core {
                 l.conns
                     .iter()
                     .copied()
-                    .filter(|&i| conns[i].as_ref().is_some_and(|c| c.tx.is_none()))
+                    .filter(|&i| {
+                        conns[i]
+                            .as_ref()
+                            .is_some_and(|c| c.tx.is_none() && !c.exclusive())
+                    })
                     .min_by_key(|&i| conns[i].as_ref().map_or(usize::MAX, Conn::load))
             };
         }
@@ -492,6 +580,7 @@ impl Core {
         let c = conns[i].as_mut().unwrap();
         match p.job {
             Job::Begin(key) => c.tx = Some(key),
+            _ if begin => {}
             _ => l.pile = Some(i),
         }
         c.send(p, ready);
@@ -662,6 +751,12 @@ impl Core {
                 && let Err(f) = c.expire(now, &mut self.ready)
             {
                 broken.push((i, f));
+            } else if let Some(c) = c
+                && c.idle()
+                && c.stale(now)
+            {
+                // too old or idle too long: closed, nothing waits on it
+                broken.push((i, Fail::text("")));
             }
         }
         for (i, f) in broken {
@@ -671,7 +766,47 @@ impl Core {
             let to = l.pool.timeout();
             while l.queue.front().is_some_and(|p| p.at + to <= now) {
                 let p = l.queue.pop_front().unwrap();
-                fail(&mut self.ready, p.id, &Fail::text(TIMED_OUT));
+                fail(&mut self.ready, p.id, &l.pool.timed_out());
+            }
+        }
+    }
+
+    /// Cancels request `id`: one that waits for a connection is dropped,
+    /// one on a connection is cancelled there. Not found (eg. it has its
+    /// answer already): nothing to do.
+    fn cancel(&mut self, id: u64) {
+        for l in self.pools.values_mut() {
+            if let Some(i) = l.queue.iter().position(|p| p.id == id) {
+                l.queue.remove(i);
+                return record(&mut self.ready, id, 5, &[]);
+            }
+        }
+        for c in self.conns.iter_mut().flatten() {
+            if c.cancel(id, &mut self.ready) {
+                return;
+            }
+        }
+    }
+
+    /// Dart wants the next chunk of stream `id`.
+    fn more(&mut self, id: u64, now: Instant) {
+        for c in self.conns.iter_mut().flatten() {
+            if c.more(id, now) {
+                return;
+            }
+        }
+    }
+
+    /// Sends the CancelRequests that are due.
+    fn cancels(&mut self) {
+        let mut now = None;
+        for c in self.conns.iter_mut().flatten() {
+            if !c.cancelling() {
+                continue;
+            }
+            let now = *now.get_or_insert_with(Instant::now);
+            if let Some(job) = c.cancel_job(now) {
+                send_cancel(job, self.me.clone());
             }
         }
     }
@@ -695,6 +830,8 @@ impl Core {
         self.share();
         self.wait_turns();
         self.flush_all();
+        // after the flush: the query is on its way before its cancel
+        self.cancels();
         self.due = self.next_due();
     }
 

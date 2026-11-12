@@ -1,5 +1,12 @@
 ## Unreleased
 
+- New: pool settings in `PgNativePool.open` and `fromUrl`. All are optional, and the defaults keep today's behavior.
+  - `requestTimeout` (default 300 s): the longest wait for one request. Before, it was fixed at 300 s. The timeout message now says the real value, eg. `timeout, no answer in 30 s`.
+  - `maxConnectionAge` (default: no limit): a connection older than this is closed when it is next free, never while it is in use.
+  - `idleTimeout` (default: kept): a free connection that is not used for this long is closed.
+- New: `PgCancelToken` and `cancelToken:` for `query` and `stream`. A cancel sends a real Postgres CancelRequest for the running query, and the future fails with the new `PgQueryCancelledException`. A query that has not started yet does not run. A cancel after the query ended does nothing. A query with a token gets a connection for itself, so the cancel can not stop another query. In a transaction, Postgres aborts the transaction.
+- New: `pool.stream(sql, chunkSize: 1000)` gives the rows in chunks, as a `Stream<PgNativeResult>`. It runs on a server-side portal, and reads the next chunk only when the listener is ready, so memory stays small for huge results. Cancel the subscription to stop the query and free the connection. It works in a transaction too.
+- The native ABI goes up at the next release: `dpg_connect` takes the three times, and the request records have new kinds (stream, cancel, next chunk) and flags. The version is not changed in this PR.
 - Requires Dart 3.14 or newer.
 - Fix: in a transaction opened by hand with `query('BEGIN')`, a query that got "cached plan must not change result type" was sent again. The second try could only fail with "current transaction is aborted" (25P02), so you did not see the real error. Now the retry looks at the transaction status the server sends after each query, and runs only when no transaction is open.
 - A failed connect now says the host and port, eg. `error connecting to server at "db.local", port 5432: Connection refused`. Before, it said only `Connection refused (os error 61)`, so a wrong host or port was hard to see. The password is never in the message.

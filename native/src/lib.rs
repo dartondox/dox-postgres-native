@@ -27,17 +27,23 @@
 //!
 //! Request record (little endian, 32 byte head): u64 id, u64 pool,
 //! u64 tx (0: no transaction), u8 kind (0 query, 1 begin, 2 commit,
-//! 3 rollback), u8 reserved, u16 param count, u32 sql length. Then the sql,
-//! then per param: u32 type oid (0: let the server pick), u8 format
-//! (0 text, 1 binary), i32 length (-1: NULL), bytes.
+//! 3 rollback, 4 stream, 5 cancel, 6 next chunk), u8 flags (see [SOLO]
+//! and [DROPPED]), u16 param count, u32 sql length. Then the sql, then per
+//! param: u32 type oid (0: let the server pick), u8 format (0 text, 1
+//! binary), i32 length (-1: NULL), bytes. A stream (kind 4) ends with a
+//! u32: the rows per chunk. Cancel (5) and next chunk (6) carry the id of
+//! the request they are for, and get no result record of their own.
 //!
 //! Result record (13 byte head): u64 id, u8 status, u32 body length.
 //! - status 0 (rows): u16 column count, per column u32 type oid, u16 name
 //!   length, name. Then u32 row count, per value i32 length (-1: NULL), bytes.
+//!   For a stream: the last chunk.
 //! - status 1 (server error): u8 field count, per field u8 code (the
 //!   Postgres error field code, eg. b'C'), u32 length, text.
 //! - status 2 (other error): the message.
 //! - status 3 (transaction started): u64 transaction id.
+//! - status 4 (a chunk of a stream, more come): like status 0.
+//! - status 5 (cancelled): no body.
 //!
 //! TLS is rustls. `sslmode` in the config turns it on (`prefer` or
 //! `require`); `dpg_connect` says how the certificate is checked, and which
@@ -63,13 +69,11 @@ const RES_HEAD: usize = 13;
 /// Statements kept per connection. Over this, the one used longest ago is
 /// closed (LRU).
 const CACHE_MAX: usize = 512;
-/// Longest wait for one request (a free connection, connect and query),
-/// like the default `queryTimeout` of the `postgres` package. Over it the
-/// request fails with a clear error, so Dart never waits forever. A
-/// transaction with no request for this long is rolled back.
-/// ponytail: fixed. Make it a pool option when an app needs another value.
-const TIMEOUT: Duration = Duration::from_secs(300);
-const TIMED_OUT: &str = "dox_postgres_native: timeout, no answer in 300 s";
+/// Request flag: the request can be cancelled. It gets a connection for
+/// itself (like a transaction), so a CancelRequest stops only this query.
+const SOLO: u8 = 1;
+/// Request flag: Dart cancelled it before it was sent. It is not run.
+const DROPPED: u8 = 2;
 
 // ---- Dart API DL -------------------------------------------------------
 // `NativeApi.initializeApiDLData` points to this table. We only need
@@ -190,8 +194,19 @@ struct Request {
     pool: u64,
     tx: u64,
     kind: u8,
+    flags: u8,
     sql: Bytes,
     params: Vec<Param>,
+    /// rows per chunk of a stream (kind 4), else 0
+    chunk: u32,
+}
+
+impl Request {
+    /// It needs a connection for itself: it can be cancelled, or it is a
+    /// stream.
+    fn solo(&self) -> bool {
+        self.flags & SOLO != 0 || self.kind == 4
+    }
 }
 
 /// None when the record is broken.
@@ -230,14 +245,25 @@ fn parse(b: &Bytes, p: &mut usize) -> Option<Request> {
         };
         params.push(Param { oid, binary, data });
     }
+    let kind = b[at + 24];
+    let mut chunk = 0;
+    if kind == 4 {
+        if q + 4 > b.len() {
+            return None;
+        }
+        chunk = rd32(b, q).max(1);
+        q += 4;
+    }
     *p = q;
     Some(Request {
         id: rd64(b, at),
         pool: rd64(b, at + 8),
         tx: rd64(b, at + 16),
-        kind: b[at + 24],
+        kind,
+        flags: b[at + 25],
         sql,
         params,
+        chunk,
     })
 }
 
@@ -417,6 +443,10 @@ struct Pool {
     wanted: AtomicUsize,
     /// the request timeout in ms (tests make it shorter)
     timeout_ms: AtomicU64,
+    /// a free connection older than this is closed. None: no limit.
+    max_age: Option<Duration>,
+    /// a connection free for this long is closed. None: kept.
+    idle: Option<Duration>,
     /// goes up after each CREATE, ALTER or DROP on a connection of this
     /// pool. A statement prepared before it is not used again: its param
     /// types were picked for the old tables.
@@ -441,6 +471,19 @@ struct PoolState {
 impl Pool {
     fn timeout(&self) -> Duration {
         Duration::from_millis(self.timeout_ms.load(Ordering::Relaxed))
+    }
+
+    /// The error of a request with no answer within the timeout.
+    fn timed_out(&self) -> Fail {
+        let ms = self.timeout_ms.load(Ordering::Relaxed);
+        let wait = if ms.is_multiple_of(1000) {
+            format!("{} s", ms / 1000)
+        } else {
+            format!("{ms} ms")
+        };
+        Fail::text(&format!(
+            "dox_postgres_native: timeout, no answer in {wait}"
+        ))
     }
 
     /// A connection of this pool closed: one more may open.
@@ -691,8 +734,8 @@ pub unsafe extern "C" fn dpg_init(data: *mut c_void) -> i32 {
 
 /// Makes a pool from a libpq style config (`host=... user=...`).
 /// Connections open when they are needed. The same config, `max_size`,
-/// `verify` and `root_cert` give the same pool, so isolates share it: up
-/// to `max_size` connections for the whole process. Each open needs one
+/// `verify`, `root_cert` and times give the same pool, so isolates share
+/// it: up to `max_size` connections for the whole process. Each open needs one
 /// [dpg_close]. Returns a pool handle (> 0), -1 when the config is bad, or
 /// -2 when the CA file can not be used. For -2 the reason is in `err`
 /// (UTF-8, cut at `err_cap` bytes, the rest untouched).
@@ -702,6 +745,11 @@ pub unsafe extern "C" fn dpg_init(data: *mut c_void) -> i32 {
 /// 2 the chain only (`verify-ca`). Any other value is `verify-full`. `root_cert` is the path of a PEM file
 /// with the CA certificates to trust (`sslrootcert`), or empty for the
 /// Mozilla and system roots.
+///
+/// `timeout_ms` is the longest wait for one request (<= 0: 300 s).
+/// `max_age_ms`: a free connection older than this is closed (<= 0: no
+/// limit). `idle_ms`: a connection free for this long is closed (<= 0:
+/// kept).
 ///
 /// The host name is looked up here, and again after a connect fails.
 ///
@@ -714,6 +762,9 @@ pub unsafe extern "C" fn dpg_connect(
     len: i64,
     max_size: i64,
     verify: i64,
+    timeout_ms: i64,
+    max_age_ms: i64,
+    idle_ms: i64,
     root_cert: *const u8,
     root_len: i64,
     err: *mut u8,
@@ -733,8 +784,12 @@ pub unsafe extern "C" fn dpg_connect(
     };
     let max_size = max_size.max(1) as usize;
     let check = Check::of(verify);
+    let timeout_ms = if timeout_ms > 0 { timeout_ms } else { 300_000 } as u64;
+    let ms = |v: i64| (v > 0).then(|| Duration::from_millis(v as u64));
+    let (max_age, idle) = (ms(max_age_ms), ms(idle_ms));
     // sslmode is in `cfg`, so the key has all the TLS settings
-    let key = format!("{max_size} {check:?} {root_cert:?} {text}");
+    let key =
+        format!("{max_size} {check:?} {timeout_ms} {max_age:?} {idle:?} {root_cert:?} {text}");
     pools(|r| {
         if let Some((handle, pool)) = r.map.iter().find(|(_, p)| p.key == key) {
             pool.refs.fetch_add(1, Ordering::Relaxed);
@@ -758,7 +813,9 @@ pub unsafe extern "C" fn dpg_connect(
             cfg: config,
             closed: AtomicBool::new(false),
             wanted: AtomicUsize::new(0),
-            timeout_ms: AtomicU64::new(TIMEOUT.as_millis() as u64),
+            timeout_ms: AtomicU64::new(timeout_ms),
+            max_age,
+            idle,
             schema: AtomicU64::new(0),
             state: Mutex::new(PoolState {
                 open: 0,
@@ -806,7 +863,7 @@ mod tests {
         b.extend_from_slice(&id.to_le_bytes());
         b.extend_from_slice(&7u64.to_le_bytes());
         b.extend_from_slice(&0u64.to_le_bytes());
-        b.extend_from_slice(&[0, 0]);
+        b.extend_from_slice(&[0, SOLO]);
         b.extend_from_slice(&(params.len() as u16).to_le_bytes());
         b.extend_from_slice(&(sql.len() as u32).to_le_bytes());
         b.extend_from_slice(sql.as_bytes());
@@ -832,7 +889,8 @@ mod tests {
         let b = Bytes::from(b);
         let mut p = 0;
         let a = parse(&b, &mut p).unwrap();
-        assert_eq!((a.id, a.pool, a.kind), (1, 7, 0));
+        assert_eq!((a.id, a.pool, a.kind, a.chunk), (1, 7, 0, 0));
+        assert!(a.solo());
         assert_eq!(&a.sql[..], b"select $1, $2");
         assert_eq!(a.params[0].data.as_deref(), Some(&b"42"[..]));
         assert!(a.params[1].data.is_none());
@@ -842,6 +900,19 @@ mod tests {
         // a cut record is dropped
         let mut p = 0;
         assert!(parse(&cut, &mut p).is_none());
+        // a stream has its chunk size after the params
+        let mut s = request(3, "select 1", &[]);
+        s[24] = 4;
+        s.extend_from_slice(&500u32.to_le_bytes());
+        s.extend(request(4, "select 2", &[]));
+        let s = Bytes::from(s);
+        let mut p = 0;
+        let a = parse(&s, &mut p).unwrap();
+        assert_eq!((a.id, a.kind, a.chunk), (3, 4, 500));
+        assert_eq!(parse(&s, &mut p).unwrap().id, 4);
+        // a stream with no chunk size is cut
+        let cut = Bytes::from(s[..40].to_vec());
+        assert!(parse(&cut, &mut 0).is_none());
     }
 
     #[test]
@@ -938,6 +1009,9 @@ mod tests {
                 len,
                 1,
                 0,
+                0,
+                0,
+                0,
                 cfg.as_ptr(),
                 root_len,
                 std::ptr::null_mut(),
@@ -960,6 +1034,9 @@ mod tests {
                 cfg.len() as i64,
                 max,
                 verify,
+                0,
+                0,
+                0,
                 std::ptr::null(),
                 0,
                 std::ptr::null_mut(),
@@ -1040,6 +1117,9 @@ IQChrAxPCa3pOVQrngZWVrIwXdxzIjmLn0PAqqeF9RpYFg==
                 cfg.len() as i64,
                 1,
                 1,
+                0,
+                0,
+                0,
                 empty.as_ptr(),
                 empty.len() as i64,
                 buf.as_mut_ptr(),

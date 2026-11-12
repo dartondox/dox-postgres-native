@@ -24,12 +24,24 @@
 //!
 //! With TLS, the protocol bytes go through a rustls `ClientConnection`
 //! (`writer`, `write_tls`, `read_tls`, `reader`).
+//!
+//! A stream (a query with a chunk size) runs on a portal: Bind, then
+//! Execute with the chunk size and Flush, not Sync. The server sends up to
+//! that many rows, then PortalSuspended. The next Execute goes only when
+//! Dart asks for the next chunk, so the server never runs far ahead. After
+//! the last row (CommandComplete) or an error, a Sync ends it. While a
+//! stream runs, other requests for the connection wait in `pre`.
+//!
+//! A cancel: a request that waits for a connection or for the login is
+//! dropped. A running one gets a CancelRequest on a new socket (see
+//! `link.rs`). The connection takes no new request until that socket is
+//! closed by the server, so the cancel can not stop the next query.
 use std::collections::{HashMap, VecDeque};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::{ErrorKind, Read, Write};
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use bytes::{Buf, Bytes, BytesMut};
 use mio::net::TcpStream;
@@ -42,9 +54,21 @@ use postgres_protocol::authentication::sasl::{ChannelBinding, ScramSha256};
 use postgres_protocol::message::frontend;
 
 use crate::{
-    Addr, CACHE_MAX, Fail, INTERNAL, Pool, Request, Ssl, TIMED_OUT, dial_error, done, fail, head,
-    record, refresh, tls_error,
+    Addr, CACHE_MAX, Fail, INTERNAL, Pool, Request, Ssl, dial_error, done, fail, head, record,
+    refresh, tls_error,
 };
+
+/// The record status of a stream chunk (more come), and of a cancelled
+/// request.
+const CHUNK: u8 = 4;
+const CANCELLED: u8 = 5;
+/// A query can be in the socket of the server, not read yet, when its
+/// CancelRequest comes. The server then ignores the cancel. So while the
+/// query still runs, the cancel is sent again after this long.
+const CANCEL_AGAIN: Duration = Duration::from_millis(50);
+/// The longest wait for the cancel socket, when the config has no
+/// `connect_timeout`.
+const CANCEL_WAIT: Duration = Duration::from_secs(10);
 
 /// Smallest free room in a read buffer before a read.
 const READ_ROOM: usize = 16 * 1024;
@@ -211,6 +235,34 @@ pub(crate) struct Pending {
     pub at: Instant,
 }
 
+impl Pending {
+    /// It needs a connection for itself (see `Request::solo`).
+    pub fn solo(&self) -> bool {
+        matches!(&self.job, Job::Query(r) if r.solo())
+    }
+}
+
+/// Where a stream is.
+#[derive(Clone, Copy, PartialEq)]
+enum Phase {
+    /// an Execute is out: rows come
+    Running,
+    /// the server sent a chunk, the next Execute waits for Dart
+    Suspended,
+    /// the Sync is out: it ends at ReadyForQuery
+    Syncing,
+}
+
+/// What a CancelRequest needs: the address and the key of the backend.
+pub(crate) struct CancelJob {
+    pub addr: Addr,
+    pub pid: i32,
+    pub secret: i32,
+    pub wait: Duration,
+    /// set when the server closed the cancel socket
+    pub done: Arc<AtomicBool>,
+}
+
 enum Kind {
     Query {
         /// its statement in `stmts`. None: the unnamed statement (a retry)
@@ -235,6 +287,55 @@ struct Wait {
     count: u32,
     fail: Option<Fail>,
     retry: bool,
+    /// Dart cancelled it
+    cancelled: bool,
+    /// it has the connection for itself
+    solo: bool,
+    /// rows per chunk of a stream, else 0
+    chunk: u32,
+    phase: Phase,
+}
+
+impl Wait {
+    fn new(id: u64, kind: Kind, at: Instant, rows: Vec<u8>) -> Wait {
+        Wait {
+            id,
+            kind,
+            at,
+            cols: None,
+            rows,
+            count: 0,
+            fail: None,
+            retry: false,
+            cancelled: false,
+            solo: false,
+            chunk: 0,
+            phase: Phase::Running,
+        }
+    }
+
+    /// The server works on it now (a stream: an Execute is out).
+    fn running(&self) -> bool {
+        self.chunk == 0 || self.phase == Phase::Running
+    }
+}
+
+/// Adds a rows record (status 0 or [CHUNK]) with the rows of `w`.
+fn rows_record(ready: &mut Vec<u8>, w: &Wait, status: u8, stmts: &HashMap<u64, Stmt>) {
+    let cols = w.cols.as_ref().or_else(|| match &w.kind {
+        Kind::Query { stmt: Some(k), .. } => stmts.get(k).and_then(|s| s.cols.as_ref()),
+        _ => None,
+    });
+    match cols {
+        Some(cols) => {
+            let at = head(ready, w.id, status);
+            ready.extend_from_slice(cols);
+            ready.extend_from_slice(&w.count.to_le_bytes());
+            ready.extend_from_slice(&w.rows);
+            done(ready, at);
+        }
+        None => record(ready, w.id, 2, b"dox_postgres_native: no columns"),
+    }
 }
 
 /// A prepared statement of one connection.
@@ -413,8 +514,18 @@ pub(crate) struct Conn {
     pre: Vec<Pending>,
     /// the transaction that owns this connection
     pub tx: Option<u64>,
-    /// the last answer of a transaction, for its idle timeout
+    /// the last answer of a transaction (for its idle timeout), or the
+    /// time it became free (for the idle timeout of the pool)
     last: Instant,
+    /// when it was opened, for the max age of the pool
+    born: Instant,
+    /// the process id and secret key of the backend, for a CancelRequest
+    key: Option<(i32, i32)>,
+    /// the last CancelRequest: done (the server closed its socket), and
+    /// when it was sent
+    cancel: Option<(Arc<AtomicBool>, Instant)>,
+    /// streams in `waits`
+    streams: usize,
 }
 
 impl Drop for Conn {
@@ -453,6 +564,10 @@ impl Conn {
                         pre: Vec::new(),
                         tx: None,
                         last: now,
+                        born: now,
+                        key: None,
+                        cancel: None,
+                        streams: 0,
                     });
                 }
                 Err(e) => last = Some(e),
@@ -486,12 +601,123 @@ impl Conn {
         self.waits.len() + self.pre.len()
     }
 
-    /// Logged in, nothing waits, no transaction.
+    /// Logged in, nothing waits, no transaction, no cancel on the way.
     pub fn idle(&self) -> bool {
         matches!(self.state, State::Ready)
             && self.waits.is_empty()
             && self.pre.is_empty()
             && self.tx.is_none()
+            && !self.held()
+    }
+
+    /// A CancelRequest for it is on the way: it takes no new request.
+    fn held(&self) -> bool {
+        self.cancel
+            .as_ref()
+            .is_some_and(|(done, _)| !done.load(Ordering::Acquire))
+    }
+
+    /// No other query may go with the one on it (see `Request::solo`). A
+    /// solo request only goes to an idle connection, so it is first.
+    pub fn exclusive(&self) -> bool {
+        self.waits.front().is_some_and(|w| w.solo)
+            || self.pre.first().is_some_and(Pending::solo)
+            || self.held()
+    }
+
+    /// A stream runs on it: new requests wait in `pre`.
+    fn streaming(&self) -> bool {
+        self.streams > 0
+    }
+
+    /// Too old (`max_age` of the pool), or free too long (`idle`). Only
+    /// closed when it is free.
+    pub fn stale(&self, now: Instant) -> bool {
+        self.retire_at().is_some_and(|t| t <= now)
+    }
+
+    fn retire_at(&self) -> Option<Instant> {
+        let age = self.pool.max_age.map(|a| self.born + a);
+        let idle = self.pool.idle.map(|d| self.last + d);
+        age.into_iter().chain(idle).min()
+    }
+
+    /// Cancels request `id` if it is on this connection. False when it is
+    /// not here. One that waits for the login is dropped. A running one
+    /// gets a CancelRequest (see [Self::cancel_job]). A stream that waits
+    /// for Dart ends with a Sync.
+    pub fn cancel(&mut self, id: u64, ready: &mut Vec<u8>) -> bool {
+        if let Some(i) = self.pre.iter().position(|p| p.id == id) {
+            self.pre.remove(i);
+            record(ready, id, CANCELLED, &[]);
+            return true;
+        }
+        let Some(w) = self.waits.iter_mut().find(|w| w.id == id) else {
+            return false;
+        };
+        w.cancelled = true;
+        if w.chunk > 0 && w.phase == Phase::Suspended {
+            w.phase = Phase::Syncing;
+            frontend::sync(&mut self.out);
+        }
+        true
+    }
+
+    /// Dart wants the next chunk of stream `id`. False when it is not
+    /// here.
+    pub fn more(&mut self, id: u64, now: Instant) -> bool {
+        let Some(w) = self.waits.front_mut().filter(|w| w.id == id) else {
+            return false;
+        };
+        if w.chunk > 0 && w.phase == Phase::Suspended {
+            w.phase = Phase::Running;
+            w.at = now;
+            // ponytail: a portal name of no bytes never fails to encode
+            let _ = frontend::execute("", w.chunk as i32, &mut self.out);
+            frontend::flush(&mut self.out);
+        }
+        true
+    }
+
+    /// A cancel to send or to clean up (cheap, so `cancel_job` and its
+    /// clock run only when needed).
+    pub fn cancelling(&self) -> bool {
+        self.cancel.is_some() || self.waits.front().is_some_and(|w| w.cancelled)
+    }
+
+    /// A CancelRequest to send now: the first request runs and Dart
+    /// cancelled it. Sent again every [CANCEL_AGAIN] while it still runs.
+    pub fn cancel_job(&mut self, now: Instant) -> Option<CancelJob> {
+        let runs = matches!(self.state, State::Ready)
+            && self
+                .waits
+                .front()
+                .is_some_and(|w| w.cancelled && w.running());
+        if let Some((done, at)) = &self.cancel {
+            if !done.load(Ordering::Acquire) {
+                return None;
+            }
+            if !runs {
+                self.cancel = None;
+                return None;
+            }
+            if *at + CANCEL_AGAIN > now {
+                return None;
+            }
+        }
+        let (pid, secret) = self.key?;
+        if !runs {
+            return None;
+        }
+        let done = Arc::new(AtomicBool::new(false));
+        self.cancel = Some((done.clone(), now));
+        Some(CancelJob {
+            addr: self.addrs.get(self.next_addr.wrapping_sub(1))?.clone(),
+            pid,
+            secret,
+            wait: self.pool.cfg.connect_timeout.unwrap_or(CANCEL_WAIT),
+            done,
+        })
     }
 
     fn need_write(&self) -> bool {
@@ -499,16 +725,29 @@ impl Conn {
     }
 
     /// The next time something is due: the end of connect, the timeout of
-    /// the oldest request, or the idle timeout of a transaction.
+    /// the oldest request, the idle timeout of a transaction, a cancel to
+    /// send again, or the close of a free connection (max age, idle).
     pub fn due(&self) -> Option<Instant> {
         if !matches!(self.state, State::Ready) {
             return Some(self.until);
         }
         let to = self.pool.timeout();
-        match self.waits.front() {
+        // only after the last one is done: the thread nudges the link then
+        let again = match (&self.cancel, self.waits.front()) {
+            (Some((done, at)), Some(w))
+                if w.cancelled && w.running() && done.load(Ordering::Acquire) =>
+            {
+                Some(*at + CANCEL_AGAIN)
+            }
+            _ => None,
+        };
+        let first = match self.waits.front() {
             Some(w) => Some(w.at + to),
-            None => self.tx.map(|_| self.last + to),
-        }
+            None if self.tx.is_some() => Some(self.last + to),
+            None if self.idle() => self.retire_at(),
+            None => None,
+        };
+        first.into_iter().chain(again).min()
     }
 
     /// Does what is due at `now`. Err: the connection must close, its
@@ -524,7 +763,7 @@ impl Conn {
         let to = self.pool.timeout();
         if let Some(w) = self.waits.front() {
             if w.at + to <= now {
-                return Err(Fail::text(TIMED_OUT));
+                return Err(self.pool.timed_out());
             }
             return Ok(());
         }
@@ -552,14 +791,16 @@ impl Conn {
         for w in self.waits.drain(..) {
             fail(ready, w.id, w.fail.as_ref().unwrap_or(f));
         }
+        self.streams = 0;
         for p in self.pre.drain(..) {
             fail(ready, p.id, f);
         }
     }
 
-    /// Takes a request. It is written to `out` now, or after the login.
+    /// Takes a request. It is written to `out` now, or after the login,
+    /// or after the stream that runs on this connection.
     pub fn send(&mut self, p: Pending, ready: &mut Vec<u8>) {
-        if !matches!(self.state, State::Ready) {
+        if !matches!(self.state, State::Ready) || !self.pre.is_empty() || self.streaming() {
             self.pre.push(p);
             return;
         }
@@ -578,21 +819,13 @@ impl Conn {
     /// A simple query (no parameters, no rows): BEGIN, COMMIT, ROLLBACK.
     fn simple(&mut self, id: u64, sql: &str, kind: Kind, at: Instant) -> Result<(), Fail> {
         frontend::query(sql, &mut self.out).map_err(|e| Fail::text(&e.to_string()))?;
-        self.waits.push_back(Wait {
-            id,
-            kind,
-            at,
-            cols: None,
-            rows: Vec::new(),
-            count: 0,
-            fail: None,
-            retry: false,
-        });
+        self.waits.push_back(Wait::new(id, kind, at, Vec::new()));
         Ok(())
     }
 
     /// Encodes the query into `out`. `retry`: on the unnamed statement,
-    /// with its own Parse.
+    /// with its own Parse. A stream asks for its first chunk and ends with
+    /// Flush, not Sync, so its portal stays open.
     fn encode(&mut self, id: u64, req: Request, at: Instant, retry: bool) -> Result<(), Fail> {
         let Ok(sql) = std::str::from_utf8(&req.sql) else {
             return Err(Fail::text("dox_postgres_native: the sql is not UTF-8"));
@@ -605,6 +838,7 @@ impl Conn {
             spare,
             names,
             tick,
+            streams,
             ..
         } = self;
         let schema = pool.schema.load(Ordering::Relaxed);
@@ -660,8 +894,13 @@ impl Conn {
                 out,
             )
             .map_err(|_| "dox_postgres_native: can not encode the parameters".to_string())?;
-            frontend::execute("", 0, out).map_err(e)?;
-            frontend::sync(out);
+            if req.chunk > 0 {
+                frontend::execute("", req.chunk as i32, out).map_err(e)?;
+                frontend::flush(out);
+            } else {
+                frontend::execute("", 0, out).map_err(e)?;
+                frontend::sync(out);
+            }
             Ok(())
         })();
         if let Err(e) = written {
@@ -685,20 +924,19 @@ impl Conn {
                 },
             );
         }
-        waits.push_back(Wait {
-            id,
-            kind: Kind::Query {
-                stmt: (!retry).then_some(k),
-                parsing: !cached,
-                req: (!retry).then_some(req),
-            },
-            at,
-            cols: None,
-            rows: spare.pop().unwrap_or_default(),
-            count: 0,
-            fail: None,
-            retry: false,
-        });
+        let (solo, chunk) = (req.solo(), req.chunk);
+        // a stream is never sent again: its rows may be with Dart already
+        let keep = !retry && chunk == 0;
+        let kind = Kind::Query {
+            stmt: (!retry).then_some(k),
+            parsing: !cached,
+            req: keep.then_some(req),
+        };
+        let mut w = Wait::new(id, kind, at, spare.pop().unwrap_or_default());
+        w.solo = solo;
+        w.chunk = chunk;
+        *streams += usize::from(chunk > 0);
+        waits.push_back(w);
         Ok(())
     }
 
@@ -1015,6 +1253,12 @@ impl Conn {
                 fail(ready, id, &f);
             }
         }
+        // a stream ended: the requests that waited behind it go now
+        if matches!(self.state, State::Ready) && !self.pre.is_empty() && !self.streaming() {
+            for p in std::mem::take(&mut self.pre) {
+                self.send(p, ready);
+            }
+        }
         Ok(())
     }
 
@@ -1069,13 +1313,19 @@ impl Conn {
                 }
             }
             b'E' => return Err(Fail(1, error_body(body))),
+            b'K' => {
+                let pid = be32(body, 0)? as i32;
+                let secret = be32(body, 4)? as i32;
+                self.key = Some((pid, secret));
+            }
             b'Z' => {
                 self.state = State::Ready;
+                self.last = Instant::now();
                 for p in std::mem::take(&mut self.pre) {
                     self.send(p, ready);
                 }
             }
-            // ParameterStatus, BackendKeyData, Notice
+            // ParameterStatus, Notice
             _ => {}
         }
         Ok(())
@@ -1094,11 +1344,13 @@ impl Conn {
             pool,
             inb,
             filled,
+            out,
             stmts,
             waits,
             spare,
             tx,
             last,
+            streams,
             ..
         } = self;
         while let Some((tag, body)) = frame(&inb[..*filled], p)? {
@@ -1155,6 +1407,27 @@ impl Conn {
                     if w.fail.is_none() {
                         w.fail = Some(Fail(1, error_body(body)));
                     }
+                    // a stream sent Flush, not Sync: the server skips all
+                    // until a Sync
+                    if w.chunk > 0 && w.phase != Phase::Syncing {
+                        w.phase = Phase::Syncing;
+                        frontend::sync(out);
+                    }
+                }
+                // PortalSuspended: a full chunk of a stream
+                b's' if w.chunk > 0 => {
+                    if w.cancelled {
+                        w.phase = Phase::Syncing;
+                        frontend::sync(out);
+                    } else {
+                        rows_record(ready, w, CHUNK, stmts);
+                        w.rows.clear();
+                        w.count = 0;
+                        w.phase = Phase::Suspended;
+                        // Dart has the chunk: the timeout counts again
+                        // from now
+                        w.at = Instant::now();
+                    }
                 }
                 // CommandComplete of a schema change: the cached
                 // statements of all connections of the pool are old.
@@ -1163,20 +1436,35 @@ impl Conn {
                 // DDL also keeps its old statement. A changed result type
                 // is still caught: 0A000, then one retry (see GONE). Only
                 // the param types of a statement stay old.
-                b'C' if is_ddl(body) => {
-                    pool.schema.fetch_add(1, Ordering::Relaxed);
+                b'C' | b'I' => {
+                    if tag == b'C' && is_ddl(body) {
+                        pool.schema.fetch_add(1, Ordering::Relaxed);
+                    }
+                    // the last rows of a stream: end it
+                    if w.chunk > 0 && w.phase == Phase::Running {
+                        w.phase = Phase::Syncing;
+                        frontend::sync(out);
+                    }
                 }
                 b'Z' => {
                     let w = waits.pop_front().unwrap();
-                    if tx.is_some() {
+                    *streams -= usize::from(w.chunk > 0);
+                    if tx.is_some() || pool.idle.is_some() {
                         *last = Instant::now();
                     }
                     // `I`: idle, so not in a transaction. This also sees
                     // a transaction opened by hand with `query('BEGIN')`.
-                    if w.retry && body.first() == Some(&b'I') {
+                    if w.retry && !w.cancelled && body.first() == Some(&b'I') {
                         if let Kind::Query { req: Some(req), .. } = w.kind {
                             retries.push((w.id, req, w.at));
                         }
+                        continue;
+                    }
+                    // a cancelled stream ends here, and a cancelled query
+                    // that the server stopped. One that ended first keeps
+                    // its result.
+                    if w.cancelled && (w.fail.is_some() || w.chunk > 0) {
+                        record(ready, w.id, CANCELLED, &[]);
                         continue;
                     }
                     if let Some(f) = &w.fail {
@@ -1190,25 +1478,12 @@ impl Conn {
                         continue;
                     }
                     match w.kind {
-                        Kind::Query { stmt, .. } => {
-                            let cols = w.cols.as_ref().or_else(|| {
-                                stmt.and_then(|k| stmts.get(&k))
-                                    .and_then(|s| s.cols.as_ref())
-                            });
-                            match cols {
-                                Some(cols) => {
-                                    let at = head(ready, w.id, 0);
-                                    ready.extend_from_slice(cols);
-                                    ready.extend_from_slice(&w.count.to_le_bytes());
-                                    ready.extend_from_slice(&w.rows);
-                                    done(ready, at);
-                                    let mut rows = w.rows;
-                                    if rows.capacity() <= SPARE_SIZE && spare.len() < SPARE_MAX {
-                                        rows.clear();
-                                        spare.push(rows);
-                                    }
-                                }
-                                None => record(ready, w.id, 2, b"dox_postgres_native: no columns"),
+                        Kind::Query { .. } => {
+                            rows_record(ready, &w, 0, stmts);
+                            let mut rows = w.rows;
+                            if rows.capacity() <= SPARE_SIZE && spare.len() < SPARE_MAX {
+                                rows.clear();
+                                spare.push(rows);
                             }
                         }
                         Kind::Begin(key) => record(ready, w.id, 3, &key.to_le_bytes()),
@@ -1217,8 +1492,8 @@ impl Conn {
                     }
                 }
                 // ParseComplete, ParameterDescription, BindComplete,
-                // CloseComplete, CommandComplete, EmptyQueryResponse,
-                // PortalSuspended
+                // CloseComplete, PortalSuspended of a query that is not a
+                // stream
                 _ => {}
             }
         }
