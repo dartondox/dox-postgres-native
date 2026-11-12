@@ -243,7 +243,7 @@ cargo +nightly fuzz run login /tmp/corpus/login fuzz/corpus/login -- -max_total_
 
 - The first folder gets the new inputs the fuzzer finds. Use a temp folder, so `fuzz/corpus/` keeps only the small seed files. Commit a new seed there only when it is useful.
 - A crash stops the run. The input that caused it is in `fuzz/artifacts/<target>/`. Run it again with `cargo +nightly fuzz run <target> fuzz/artifacts/<target>/<file>`.
-- The `conn_read` seeds also run as a unit test (`cargo test`). Its input is: one byte for the piece size, one byte for the request count, one byte per request, then the server bytes.
+- The seeds of all targets also run as a unit test (`cargo test`). The `conn_read` input is: one byte for the piece size, one byte for the request count, one byte per request, then the server bytes. The `login` input is: one byte for the piece size, one byte for the count of waiting queries, then the server bytes.
 - The fuzz crate builds the same source as `native/`. Keep the dependencies in `native/fuzz/Cargo.toml` the same as in `native/Cargo.toml`. CI checks this. `fallible-iterator` is there only for the fuzz code, which reads `postgres-protocol` messages.
 
 ## Documentation

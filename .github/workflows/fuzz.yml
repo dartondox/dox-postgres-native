@@ -2,8 +2,8 @@ name: Fuzz
 
 # Runs each fuzz target in native/fuzz for 60 s (inputs up to 64 KB): random
 # bytes as messages from the Postgres server, as a row description with
-# rows, into the read loop of a connection, and into its login. A crash or a failed check
-# fails the run and uploads the input that caused it.
+# rows, into the read loop of a connection, and into its login. A crash or
+# a failed check fails the run and uploads the input that caused it.
 
 on:
   push:
