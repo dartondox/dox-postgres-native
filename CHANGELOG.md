@@ -1,5 +1,6 @@
 ## Unreleased
 
+- Requires Dart 3.14 or newer.
 - Fix: in a transaction opened by hand with `query('BEGIN')`, a query that got "cached plan must not change result type" was sent again. The second try could only fail with "current transaction is aborted" (25P02), so you did not see the real error. Now the retry looks at the transaction status the server sends after each query, and runs only when no transaction is open.
 - A failed connect now says the host and port, eg. `error connecting to server at "db.local", port 5432: Connection refused`. Before, it said only `Connection refused (os error 61)`, so a wrong host or port was hard to see. The password is never in the message.
 - Login and TLS errors from the driver now also say the host and port, eg. `error performing TLS handshake with server at "db.local", port 5432: server does not support TLS`. Before, they did not say which server. Errors that the server itself sends (eg. a wrong password) do not change.
