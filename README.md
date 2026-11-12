@@ -218,6 +218,32 @@ If the app still opens a pool, it throws an error that says the library is not i
 - Parameters as a map for `@name`, or a list for `$1, $2`.
 - TLS with rustls.
 
+## Fuzzing
+
+The code that reads bytes from the server has fuzz targets in `native/fuzz/`. CI runs each one for 60 seconds when `native/` changes.
+
+- `messages`: random bytes as a stream of backend messages. It cuts the frames with `frame` and runs `columns`, `row`, `error_body` and `error_code` on each body. All at once and in small pieces must give the same result. Where the `postgres-protocol` crate reads a DataRow, a RowDescription or an ErrorResponse without an error, our parser must give the same values.
+- `rows`: a RowDescription and DataRows built from the input, made into a rows record with `rows_record`. The record must have the exact shape that Dart reads (`_rows` in `lib/src/pool.dart`): its lengths match what follows, and it ends where the length says.
+- `conn_read`: the real read loop of a connection (`Conn::messages`), with some requests waiting (queries, a stream, BEGIN, COMMIT), fed with server bytes. No panic. All at once and in pieces give the same records, the same error and the same bytes to send. Every record `ready` has the shape Dart reads. The records are not much bigger than the input. A DataRow with another count of values than the columns is refused.
+
+To run one locally:
+
+```sh
+rustup toolchain install nightly
+cargo install cargo-fuzz --locked
+cd native
+cp Cargo.lock fuzz/Cargo.lock
+mkdir -p /tmp/corpus/messages /tmp/corpus/rows /tmp/corpus/conn_read
+cargo +nightly fuzz run messages /tmp/corpus/messages fuzz/corpus/messages -- -max_total_time=300 -max_len=65536
+cargo +nightly fuzz run rows /tmp/corpus/rows fuzz/corpus/rows -- -max_total_time=300 -max_len=65536
+cargo +nightly fuzz run conn_read /tmp/corpus/conn_read fuzz/corpus/conn_read -- -max_total_time=300 -max_len=65536
+```
+
+- The first folder gets the new inputs the fuzzer finds. Use a temp folder, so `fuzz/corpus/` keeps only the small seed files. Commit a new seed there only when it is useful.
+- A crash stops the run. The input that caused it is in `fuzz/artifacts/<target>/`. Run it again with `cargo +nightly fuzz run <target> fuzz/artifacts/<target>/<file>`.
+- The `conn_read` seeds also run as a unit test (`cargo test`). Its input is: one byte for the piece size, one byte for the request count, one byte per request, then the server bytes.
+- The fuzz crate builds the same source as `native/`. Keep the dependencies in `native/fuzz/Cargo.toml` the same as in `native/Cargo.toml`. CI checks this. `fallible-iterator` is there only for the fuzz code, which reads `postgres-protocol` messages.
+
 ## Documentation
 
 - [Native Postgres driver](https://dartondox.dev/latest/database/postgres-native/)

@@ -134,6 +134,7 @@ name = "dox_postgres_native"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "fallible-iterator",
  "libc",
  "mio",
  "postgres-protocol",

@@ -185,6 +185,10 @@ fn columns(b: &[u8]) -> Result<Vec<u8>, Fail> {
         let rest = b.get(p..).ok_or_else(bad)?;
         let end = rest.iter().position(|&c| c == 0).ok_or_else(bad)? + p;
         let name = &b[p..end];
+        // the record has two bytes for the length (a real name has 63 at most)
+        if name.len() > u16::MAX as usize {
+            return Err(bad());
+        }
         // after the name: table oid u32, column i16, type oid u32, ...
         let oid = be32(b, end + 7)?;
         out.extend_from_slice(&oid.to_le_bytes());
@@ -285,6 +289,9 @@ struct Wait {
     cols: Option<Vec<u8>>,
     rows: Vec<u8>,
     count: u32,
+    /// the column count the DataRows of this chunk must have. Set at the
+    /// first row, so a cached statement looks its columns up once.
+    width: Option<usize>,
     fail: Option<Fail>,
     retry: bool,
     /// Dart cancelled it
@@ -309,6 +316,7 @@ impl Wait {
             cols: None,
             rows,
             count: 0,
+            width: None,
             fail: None,
             retry: false,
             cancelled: false,
@@ -330,13 +338,18 @@ impl Wait {
     }
 }
 
-/// Adds a rows record (status 0 or [CHUNK]) with the rows of `w`.
-fn rows_record(ready: &mut Vec<u8>, w: &Wait, status: u8, stmts: &HashMap<u64, Stmt>) {
-    let cols = w.cols.as_ref().or_else(|| match &w.kind {
+/// The column part of the result of `w`: from its own RowDescription, or
+/// from the cached statement.
+fn cols_of<'a>(w: &'a Wait, stmts: &'a HashMap<u64, Stmt>) -> Option<&'a Vec<u8>> {
+    w.cols.as_ref().or_else(|| match &w.kind {
         Kind::Query { stmt: Some(k), .. } => stmts.get(k).and_then(|s| s.cols.as_ref()),
         _ => None,
-    });
-    match cols {
+    })
+}
+
+/// Adds a rows record (status 0 or [CHUNK]) with the rows of `w`.
+fn rows_record(ready: &mut Vec<u8>, w: &Wait, status: u8, stmts: &HashMap<u64, Stmt>) {
+    match cols_of(w, stmts) {
         Some(cols) => {
             let at = head(ready, w.id, status);
             ready.extend_from_slice(cols);
@@ -1425,6 +1438,15 @@ impl Conn {
             };
             match tag {
                 b'D' => {
+                    // Dart reads the columns for each row, so a row with
+                    // another count of values would be read wrong
+                    if w.count == 0 {
+                        w.width =
+                            cols_of(w, stmts).map(|c| usize::from(c[0]) | usize::from(c[1]) << 8);
+                    }
+                    if w.width.is_some_and(|n| be16(body, 0).ok() != Some(n)) {
+                        return Err(bad());
+                    }
                     row(&mut w.rows, body)?;
                     w.count += 1;
                 }
@@ -1610,6 +1632,11 @@ mod tests {
         assert!(columns(&[0, 1, b'n']).is_err());
         assert!(columns(&[0, 1, b'n', 0, 0, 0]).is_err());
         assert!(columns(&[0, 2]).is_err());
+        // a name too long for the u16 length in the record
+        let mut long = vec![0, 1];
+        long.extend_from_slice(&[b'n'; 65536]);
+        long.extend_from_slice(&[0; 19]);
+        assert!(columns(&long).is_err());
         // DataRow: no count, no length, a length past the end
         let mut out = Vec::new();
         assert!(row(&mut out, &[]).is_err());
@@ -1621,6 +1648,52 @@ mod tests {
         assert!(be32(&[1, 2, 3, 4], usize::MAX).is_err());
         // a frame with a length below 4
         assert!(frame(&[b'Z', 0, 0, 0, 3, 0], 0).is_err());
+    }
+
+    /// A DataRow with another count of values than the columns would make
+    /// a record that Dart reads wrong: the connection must refuse it.
+    #[cfg(unix)]
+    #[test]
+    fn a_row_with_the_wrong_value_count_is_refused() {
+        let msg = |t: u8, b: &[u8]| {
+            let mut m = vec![t];
+            m.extend_from_slice(&(b.len() as u32 + 4).to_be_bytes());
+            m.extend_from_slice(b);
+            m
+        };
+        // one column "n" (int4), then a row with 0, 1 or 2 values
+        let mut t = vec![0, 1, b'n', 0];
+        t.extend_from_slice(&[0; 6]);
+        t.extend_from_slice(&23u32.to_be_bytes());
+        t.extend_from_slice(&[0; 8]);
+        let one = [0, 1, 0, 0, 0, 1, b'x'];
+        for (values, ok) in [
+            (&[0, 0][..], false),
+            (&one[..], true),
+            (&[0, 2, 0, 0, 0, 0, 0, 0, 0, 0][..], false),
+        ] {
+            let mut stream = msg(b'1', &[]);
+            stream.extend(msg(b't', &[0, 0]));
+            stream.extend(msg(b'T', &t));
+            stream.extend(msg(b'2', &[]));
+            stream.extend(msg(b'D', values));
+            stream.extend(msg(b'Z', b"I"));
+            for step in [usize::MAX, 1] {
+                let run = fuzz::feed(&[0], &stream, step);
+                assert_eq!(run.fail.is_none(), ok);
+                assert_eq!(run.waits, usize::from(!ok));
+            }
+        }
+    }
+
+    /// The seed files of the fuzz targets must not break a check.
+    #[cfg(unix)]
+    #[test]
+    fn the_fuzz_seeds_pass() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/fuzz/corpus/conn_read");
+        for f in std::fs::read_dir(dir).unwrap() {
+            fuzz::conn_read(&std::fs::read(f.unwrap().path()).unwrap());
+        }
     }
 
     fn stmt(used: u64) -> Stmt {
@@ -1649,5 +1722,469 @@ mod tests {
         let (k, _) = evict(&mut stmts, 2, 2).unwrap();
         assert_eq!(k, 2);
         assert_eq!(stmts.len(), 1);
+    }
+}
+
+/// Entry points for the fuzz targets in `fuzz/`. Only in `cargo fuzz`
+/// builds (`--cfg fuzzing`, Unix), not in the library.
+#[cfg(all(any(fuzzing, test), unix))]
+#[doc(hidden)]
+#[cfg_attr(test, allow(dead_code))]
+pub mod fuzz {
+    use super::*;
+    use crate::{Config, Pool, PoolState, RES_HEAD, Request, Ssl};
+    use fallible_iterator::FallibleIterator;
+    use postgres_protocol::message::backend::Message as Pg;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU64, AtomicUsize};
+
+    // ---- messages: the parse functions, one message at a time --------------
+
+    /// What the read loop does with the body of one message, as bytes.
+    /// An error in a parser is one byte, `0xFF`.
+    fn parse(tag: u8, body: &[u8]) -> Vec<u8> {
+        let mut out = vec![tag];
+        match tag {
+            b'T' => match columns(body) {
+                Ok(c) => {
+                    assert!(c.len() <= body.len());
+                    out.extend_from_slice(&c);
+                }
+                Err(_) => out.push(0xFF),
+            },
+            b'D' => {
+                let mut v = Vec::new();
+                match row(&mut v, body) {
+                    Ok(()) => {
+                        assert!(v.len() <= body.len());
+                        out.extend_from_slice(&v);
+                    }
+                    Err(_) => out.push(0xFF),
+                }
+            }
+            b'E' | b'N' => {
+                let e = error_body(body);
+                // a field of one byte (a code, no text) becomes 5 bytes
+                assert!(e.len() <= 5 * body.len() + 1);
+                assert!(error_code(body).len() <= body.len());
+                out.extend_from_slice(&e);
+            }
+            b'C' | b'I' => out.push(u8::from(is_ddl(body))),
+            _ => out.extend_from_slice(body),
+        }
+        out
+    }
+
+    /// Reads all messages of `data` the way the read loop does: the bytes
+    /// come `step` at a time, and `frame` looks at what has come so far.
+    /// Gives the parsed messages, and true when a frame was broken.
+    fn read_all(data: &[u8], step: usize) -> (Vec<Vec<u8>>, bool) {
+        let mut msgs = Vec::new();
+        let (mut p, mut filled) = (0, 0);
+        loop {
+            match frame(&data[..filled], p) {
+                Err(_) => return (msgs, true),
+                Ok(Some((tag, body))) => {
+                    msgs.push(parse(tag, body));
+                    p += 5 + body.len();
+                }
+                Ok(None) if filled == data.len() => return (msgs, false),
+                Ok(None) => filled = data.len().min(filled + step),
+            }
+        }
+    }
+
+    /// Our values of a DataRow as (NULL or not, bytes) pairs, read back
+    /// from the record format.
+    fn values_of(r: &[u8]) -> Vec<Option<&[u8]>> {
+        let mut v = Vec::new();
+        let mut p = 0;
+        while p < r.len() {
+            let len = i32::from_le_bytes([r[p], r[p + 1], r[p + 2], r[p + 3]]);
+            p += 4;
+            if len < 0 {
+                v.push(None);
+            } else {
+                v.push(Some(&r[p..p + len as usize]));
+                p += len as usize;
+            }
+        }
+        v
+    }
+
+    /// Where `postgres-protocol` reads a message without an error, we must
+    /// read the same values.
+    fn same_as_postgres_protocol(data: &[u8]) {
+        let mut p = 0;
+        while let Ok(Some((tag, body))) = frame(data, p) {
+            let whole = &data[p..p + 5 + body.len()];
+            p += whole.len();
+            if !matches!(tag, b'T' | b'D' | b'E' | b'N') {
+                continue;
+            }
+            let mut buf = BytesMut::from(whole);
+            // it may refuse a body that is not well formed (eg. a DataRow
+            // with no count). The frame is the same length: no byte is left.
+            let Ok(Some(msg)) = Pg::parse(&mut buf) else {
+                continue;
+            };
+            assert!(buf.is_empty());
+            match msg {
+                Pg::DataRow(d) => {
+                    let mut theirs = Vec::new();
+                    let mut ranges = d.ranges();
+                    let ok = loop {
+                        match ranges.next() {
+                            Ok(Some(r)) => theirs.push(r.map(|r| &d.buffer()[r])),
+                            Ok(None) => break true,
+                            Err(_) => break false,
+                        }
+                    };
+                    let mut mine = Vec::new();
+                    if ok {
+                        row(&mut mine, body).expect("a row that postgres-protocol reads");
+                        assert!(values_of(&mine) == theirs);
+                    }
+                }
+                Pg::RowDescription(t) => {
+                    let mut fields = t.fields();
+                    let mut theirs = Vec::new();
+                    let ok = loop {
+                        match fields.next() {
+                            Ok(Some(f)) => theirs.push((f.name().to_string(), f.type_oid())),
+                            Ok(None) => break true,
+                            Err(_) => break false,
+                        }
+                    };
+                    if ok {
+                        let mine =
+                            columns(body).expect("a description that postgres-protocol reads");
+                        let mut q = 2;
+                        for (name, oid) in &theirs {
+                            let n = usize::from(u16::from_le_bytes([mine[q + 4], mine[q + 5]]));
+                            assert_eq!(&mine[q..q + 4], &oid.to_le_bytes());
+                            assert_eq!(&mine[q + 6..q + 6 + n], name.as_bytes());
+                            q += 6 + n;
+                        }
+                        assert_eq!(q, mine.len());
+                    }
+                }
+                Pg::ErrorResponse(e) => {
+                    let mut fields = e.fields();
+                    let mut theirs = Vec::new();
+                    let ok = loop {
+                        match fields.next() {
+                            Ok(Some(f)) => theirs.push((f.type_(), f.value_bytes().to_vec())),
+                            Ok(None) => break true,
+                            Err(_) => break false,
+                        }
+                    };
+                    if ok && theirs.len() < 255 {
+                        let mine = error_body(body);
+                        assert_eq!(usize::from(mine[0]), theirs.len());
+                        let mut q = 1;
+                        for (t, v) in &theirs {
+                            let n = u32::from_le_bytes([
+                                mine[q + 1],
+                                mine[q + 2],
+                                mine[q + 3],
+                                mine[q + 4],
+                            ]);
+                            assert_eq!(mine[q], *t);
+                            assert_eq!(&mine[q + 5..q + 5 + n as usize], &v[..]);
+                            q += 5 + n as usize;
+                        }
+                        let code = theirs.iter().find(|(t, _)| *t == b'C');
+                        assert_eq!(error_code(body), code.map_or(&b""[..], |c| &c.1[..]));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Random bytes as a stream of backend messages. All at once and in
+    /// small pieces must give the same messages, and `postgres-protocol`
+    /// must read the same values.
+    pub fn messages(data: &[u8]) {
+        let step = data.first().map_or(1, |&b| usize::from(b) % 64 + 1);
+        let whole = read_all(data, data.len().max(1));
+        assert!(whole == read_all(data, step));
+        same_as_postgres_protocol(data);
+    }
+
+    // ---- rows: a RowDescription and DataRows -> a rows record ------------
+
+    /// Walks the column part of a rows record. Gives where it ends.
+    fn cols_end(c: &[u8]) -> (usize, usize) {
+        let count = usize::from(u16::from_le_bytes([c[0], c[1]]));
+        let mut p = 2;
+        for _ in 0..count {
+            let n = usize::from(u16::from_le_bytes([c[p + 4], c[p + 5]]));
+            p += 6 + n;
+        }
+        (count, p)
+    }
+
+    /// Walks `count` values of a rows record. It must end exactly at the end.
+    fn check_values(r: &[u8], count: usize) {
+        let mut p = 0;
+        for _ in 0..count {
+            let len = i32::from_le_bytes([r[p], r[p + 1], r[p + 2], r[p + 3]]);
+            p += 4 + len.max(0) as usize;
+        }
+        assert_eq!(p, r.len());
+    }
+
+    /// A rows record body, as Dart reads it (`_rows` in lib/src/pool.dart):
+    /// the columns, a u32 row count, then for each row one value per column.
+    /// It must end exactly at the end of the body.
+    fn check_rows_body(b: &[u8]) {
+        let (cols, p) = cols_end(b);
+        let rows = u32::from_le_bytes([b[p], b[p + 1], b[p + 2], b[p + 3]]) as usize;
+        check_values(&b[p + 4..], rows * cols);
+    }
+
+    /// An error record body, as Dart reads it (`_fields`): a count, then per
+    /// field a code, a u32 length and the text.
+    fn check_error_body(b: &[u8]) {
+        let mut p = 1;
+        for _ in 0..b[0] {
+            p += 5 + u32::from_le_bytes([b[p + 1], b[p + 2], b[p + 3], b[p + 4]]) as usize;
+        }
+        assert_eq!(p, b.len());
+    }
+
+    /// Every record in `ready` must be whole and have the shape Dart reads.
+    fn check_records(ready: &[u8]) {
+        let mut p = 0;
+        while p < ready.len() {
+            assert!(ready.len() - p >= RES_HEAD);
+            let status = ready[p + 8];
+            let len =
+                u32::from_le_bytes([ready[p + 9], ready[p + 10], ready[p + 11], ready[p + 12]]);
+            let end = p + RES_HEAD + len as usize;
+            assert!(end <= ready.len());
+            let body = &ready[p + RES_HEAD..end];
+            match status {
+                0 | CHUNK => check_rows_body(body),
+                1 => check_error_body(body),
+                2 => {}
+                3 => assert_eq!(body.len(), 8),
+                CANCELLED => assert!(body.is_empty()),
+                _ => panic!("unknown status {status}"),
+            }
+            p = end;
+        }
+    }
+
+    /// A RowDescription and DataRows from the input, made into a rows
+    /// record like `rows_record` does for a finished query. Input: u16
+    /// size of the RowDescription body, that body, then DataRow bodies,
+    /// each with a u16 size in front. A row with another count of values
+    /// than the columns is not an input of this target (the read loop
+    /// refuses it, see `conn_read`).
+    pub fn rows(data: &[u8]) {
+        let Ok(n) = be16(data, 0) else { return };
+        let Some(t) = data.get(2..2 + n) else { return };
+        let Ok(cols) = columns(t) else { return };
+        let width = usize::from(u16::from_le_bytes([cols[0], cols[1]]));
+        let mut rows = Vec::new();
+        let mut count = 0u32;
+        let mut p = 2 + n;
+        while let Ok(size) = be16(data, p) {
+            let Some(d) = data.get(p + 2..p + 2 + size) else {
+                break;
+            };
+            p += 2 + size;
+            if be16(d, 0).ok() != Some(width) {
+                continue;
+            }
+            let before = rows.len();
+            if row(&mut rows, d).is_err() {
+                rows.truncate(before);
+                continue;
+            }
+            count += 1;
+        }
+        let kind = Kind::Query {
+            stmt: None,
+            parsing: false,
+            req: None,
+        };
+        let mut w = Wait::new(7, kind, Instant::now(), rows);
+        w.cols = Some(cols);
+        w.count = count;
+        let mut ready = Vec::new();
+        rows_record(&mut ready, &w, 0, &HashMap::new());
+        let cols = w.cols.as_ref().unwrap();
+        assert_eq!(ready.len(), RES_HEAD + cols.len() + 4 + w.rows.len());
+        check_records(&ready);
+        assert!(ready.len() <= RES_HEAD + 2 * data.len() + 6);
+    }
+
+    // ---- conn_read: the read loop of a connection -------------------------
+
+    /// A logged in connection with some requests waiting for an answer,
+    /// made from `setup`: one byte per request. The socket is one end of a
+    /// pair, and is never read: the bytes come in through `feed`.
+    fn conn(setup: &[u8]) -> (Conn, std::os::unix::net::UnixStream) {
+        let (a, b) = std::os::unix::net::UnixStream::pair().unwrap();
+        a.set_nonblocking(true).unwrap();
+        let cfg = Config {
+            host: "h".into(),
+            port: 5432,
+            user: "u".into(),
+            password: Vec::new(),
+            dbname: None,
+            options: None,
+            application_name: None,
+            connect_timeout: None,
+            ssl: Ssl::Disable,
+        };
+        let state = PoolState {
+            open: 1,
+            idle: Vec::new(),
+            waiting: VecDeque::new(),
+            addrs: Ok(Vec::new()),
+            resolving: false,
+        };
+        let pool = Arc::new(Pool {
+            key: String::new(),
+            refs: AtomicUsize::new(1),
+            max: 1,
+            cfg,
+            tls: None,
+            closed: AtomicBool::new(false),
+            wanted: AtomicUsize::new(0),
+            timeout_ms: AtomicU64::new(1000),
+            max_age: None,
+            idle: None,
+            schema: AtomicU64::new(0),
+            state: Mutex::new(state),
+        });
+        let now = Instant::now();
+        let mut c = Conn {
+            until: now + Duration::from_secs(1),
+            pool,
+            sock: Sock::Unix(mio::net::UnixStream::from_std(a)),
+            tls: None,
+            state: State::Ready,
+            next_addr: 0,
+            addrs: Vec::new(),
+            out: BytesMut::new(),
+            writable: false,
+            inb: Vec::new(),
+            filled: 0,
+            stmts: HashMap::new(),
+            tick: 0,
+            names: 0,
+            waits: VecDeque::new(),
+            spare: Vec::new(),
+            pre: Vec::new(),
+            tx: None,
+            last: now,
+            born: now,
+            key: None,
+            cancel: None,
+            streams: 0,
+        };
+        for (i, &b) in setup.iter().enumerate() {
+            let id = i as u64 + 1;
+            match b & 3 {
+                // a query, maybe the same sql as another (a cached
+                // statement), maybe a stream
+                0 | 1 => {
+                    let sql = if b & 16 != 0 {
+                        "select 1".to_string()
+                    } else {
+                        format!("select {i}")
+                    };
+                    let chunk = if b & 4 != 0 { 2 } else { 0 };
+                    let req = Request {
+                        id,
+                        pool: 0,
+                        tx: 0,
+                        kind: if chunk > 0 { 4 } else { 0 },
+                        flags: if b & 8 != 0 { crate::SOLO } else { 0 },
+                        sql: Bytes::from(sql),
+                        params: Vec::new(),
+                        chunk,
+                    };
+                    let _ = c.encode(id, req, now, false);
+                }
+                2 => {
+                    c.tx = Some(5);
+                    c.waits
+                        .push_back(Wait::new(id, Kind::Begin(5), now, Vec::new()));
+                }
+                _ => c.waits.push_back(Wait::new(id, Kind::End, now, Vec::new())),
+            }
+        }
+        (c, b)
+    }
+
+    /// What one run of the read loop gave.
+    #[derive(PartialEq, Debug)]
+    pub(super) struct Run {
+        pub(super) ready: Vec<u8>,
+        pub(super) fail: Option<(u8, Vec<u8>)>,
+        pub(super) waits: usize,
+        out: Vec<u8>,
+    }
+
+    /// Gives `stream` to the read loop `step` bytes at a time (at most the
+    /// room `fill` would give), like the socket does.
+    pub(super) fn feed(setup: &[u8], stream: &[u8], step: usize) -> Run {
+        let (mut c, _peer) = conn(setup);
+        let mut ready = Vec::new();
+        let mut fail = None;
+        let mut p = 0;
+        loop {
+            Conn::room(&mut c.inb, c.filled);
+            let n = step.min(stream.len() - p).min(c.inb.len() - c.filled);
+            c.inb[c.filled..c.filled + n].copy_from_slice(&stream[p..p + n]);
+            c.filled += n;
+            p += n;
+            if let Err(f) = c.messages(&mut ready) {
+                fail = Some((f.0, f.1));
+                break;
+            }
+            // only a message that is not whole stays in the buffer
+            assert!(c.filled <= p);
+            if p == stream.len() {
+                break;
+            }
+        }
+        Run {
+            ready,
+            fail,
+            waits: c.waits.len(),
+            out: c.out.to_vec(),
+        }
+    }
+
+    /// Bytes from a server, for a connection with some requests waiting.
+    /// Input: byte 0 the size of the pieces, byte 1 how many requests
+    /// (1 to 8), then one byte for each request, then the server bytes.
+    /// - no panic, and no record that Dart would read wrong (see
+    ///   `check_records`)
+    /// - all at once and in pieces give the same records, the same error
+    ///   and the same bytes to send
+    /// - the records are not much bigger than the input
+    pub fn conn_read(data: &[u8]) {
+        let [step, n, rest @ ..] = data else { return };
+        let n = usize::from(*n) % 8 + 1;
+        let Some((setup, stream)) = rest.split_at_checked(n) else {
+            return;
+        };
+        let whole = feed(setup, stream, usize::MAX);
+        let pieces = feed(setup, stream, usize::from(*step) % 64 + 1);
+        assert_eq!(whole, pieces);
+        check_records(&whole.ready);
+        if let Some((1, body)) = &whole.fail {
+            check_error_body(body);
+        }
+        assert!(whole.ready.len() <= 6 * stream.len() + 64 * n);
     }
 }

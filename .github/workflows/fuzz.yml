@@ -1,0 +1,81 @@
+name: Fuzz
+
+# Runs each fuzz target in native/fuzz for 60 s (inputs up to 64 KB): random
+# bytes as messages from the Postgres server, as a row description with
+# rows, and into the read loop of a connection. A crash or a failed check
+# fails the run and uploads the input that caused it.
+
+on:
+  push:
+    branches: [main]
+    paths: ['native/**', '.github/workflows/fuzz.yml']
+  pull_request:
+    paths: ['native/**', '.github/workflows/fuzz.yml']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fuzz-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [messages, rows, conn_read]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # the fuzz crate builds the same source, so it must use the same
+      # dependencies as native/Cargo.toml (dependabot only updates that one)
+      - name: Check that the fuzz dependencies match
+        working-directory: native
+        run: |
+          # the check reads `[dependencies]` style sections only, not
+          # `[dependencies.name]` tables
+          if grep -nE '^\[(target\..*\.)?dependencies\.' Cargo.toml fuzz/Cargo.toml; then
+            echo "::error::use one line per dependency, not a [dependencies.name] table"
+            exit 1
+          fi
+          # the dependency sections, with their header lines
+          deps() {
+            awk '/^\[/ { s = ($0 == "[dependencies]" || index($0, ".dependencies]") > 0); if (s) print; next }
+                 s && NF && !/^#/ && !/^libfuzzer-sys/' "$1"
+          }
+          diff <(deps Cargo.toml) <(deps fuzz/Cargo.toml)
+      # use the lock file of native/, so the versions are the same too
+      - name: Copy the lock file
+        working-directory: native
+        run: cp Cargo.lock fuzz/Cargo.lock
+      # cargo fuzz needs nightly (sanitizer flags)
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: nightly
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: native/fuzz
+      # a prebuilt cargo-fuzz, no build from source
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        with:
+          tool: cargo-fuzz
+      # new inputs go to a temp folder, the seeds in fuzz/corpus stay as they are
+      - name: Fuzz ${{ matrix.target }}
+        working-directory: native
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/corpus"
+          # the prebuilt cargo-fuzz is a musl build and picks musl by
+          # default. The sanitizer needs the host (glibc) target.
+          host=$(rustc -vV | sed -n 's/^host: //p')
+          cargo fuzz run --target "$host" "$TARGET" "$RUNNER_TEMP/corpus" "fuzz/corpus/$TARGET" -- -max_total_time=60 -max_len=65536
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: failure()
+        with:
+          name: fuzz-${{ matrix.target }}
+          path: native/fuzz/artifacts

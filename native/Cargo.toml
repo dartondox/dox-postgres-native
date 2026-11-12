@@ -9,6 +9,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 bytes = "1.12.1"
+fallible-iterator = "0.2.0"
 mio = { version = "1.2.4", features = ["os-poll", "net"] }
 postgres-protocol = "0.6.12"
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
@@ -17,6 +18,10 @@ webpki-roots = "1.0.11"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.191"
+
+# cargo fuzz builds with `--cfg fuzzing`, see src/conn.rs `mod fuzz`
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
 
 [profile.release]
 opt-level = 3
