@@ -61,6 +61,11 @@ use bytes::Bytes;
 mod conn;
 mod link;
 
+// entry points for the fuzz targets, only in `cargo fuzz` builds
+#[cfg(fuzzing)]
+#[doc(hidden)]
+pub use conn::fuzz;
+
 use conn::Conn;
 
 /// Bump when the FFI functions or the record layout change.

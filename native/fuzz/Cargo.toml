@@ -1,0 +1,66 @@
+[package]
+name = "dox_postgres_native-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+# The library source of native/ is built here as an rlib. native/ itself
+# stays a cdylib only, so fuzzing does not change the shipped library.
+# Keep these dependencies the same as in native/Cargo.toml.
+[lib]
+name = "dox_postgres_native"
+path = "../src/lib.rs"
+test = false
+doc = false
+
+[dependencies]
+libfuzzer-sys = "0.4.13"
+bytes = "1.12.1"
+fallible-iterator = "0.2.0"
+mio = { version = "1.2.4", features = ["os-poll", "net"] }
+postgres-protocol = "0.6.12"
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-native-certs = "0.8.5"
+webpki-roots = "1.0.11"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.191"
+
+# the source of native/ has `#[cfg(fuzzing)]`, which cargo fuzz sets
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
+
+# its own workspace, so it is not part of the main build
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "messages"
+path = "fuzz_targets/messages.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rows"
+path = "fuzz_targets/rows.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "conn_read"
+path = "fuzz_targets/conn_read.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "login"
+path = "fuzz_targets/login.rs"
+test = false
+doc = false
+bench = false

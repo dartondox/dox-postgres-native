@@ -1,0 +1,5 @@
+target
+artifacts
+coverage
+# CI and the README copy it from native/Cargo.lock
+Cargo.lock
