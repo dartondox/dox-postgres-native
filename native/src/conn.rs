@@ -841,11 +841,18 @@ impl Conn {
     /// Takes a request. It is written to `out` now, or after the login,
     /// after the stream that runs on this connection, or after the
     /// CancelRequest on the way (it must not stop this one).
+    ///
+    /// A solo request (a query with a cancel token, eg. in a transaction)
+    /// is never pipelined with another one: it waits until the queries
+    /// before it are done, and the ones after it wait until it is done.
+    /// So its CancelRequest can only stop it.
     pub fn send(&mut self, p: Pending, ready: &mut Vec<u8>) {
         if !matches!(self.state, State::Ready)
             || !self.pre.is_empty()
             || self.streaming()
             || self.held()
+            || self.waits.back().is_some_and(|w| w.solo)
+            || (p.solo() && !self.waits.is_empty())
         {
             self.pre.push(p);
             return;
@@ -971,8 +978,9 @@ impl Conn {
             );
         }
         let (solo, chunk) = (req.solo(), req.chunk);
-        // a stream is never sent again: its rows may be with Dart already
-        let keep = !retry && chunk == 0;
+        // kept for one retry; a stream drops it at its first chunk, then
+        // its rows are with Dart and it is never sent again
+        let keep = !retry;
         let kind = Kind::Query {
             stmt: (!retry).then_some(k),
             parsing: !cached,
@@ -1463,6 +1471,9 @@ impl Conn {
                         frontend::sync(out);
                     } else {
                         rows_record(ready, w, CHUNK, stmts);
+                        if let Kind::Query { req, .. } = &mut w.kind {
+                            *req = None;
+                        }
                         w.rows.clear();
                         w.count = 0;
                         w.phase = Phase::Suspended;

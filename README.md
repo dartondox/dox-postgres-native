@@ -110,7 +110,7 @@ try {
 - Cancel before the query starts: it does not run.
 - Cancel while it runs: the driver sends a Postgres CancelRequest for it, and the future fails with `PgQueryCancelledException`.
 - Cancel after it ended: nothing happens. You keep the result.
-- A query with a token gets a connection for itself, so the cancel can not stop another query.
+- A query with a token gets a connection for itself, so the cancel can not stop another query. In a transaction, it is not pipelined: it waits for the queries before it, and the ones after it wait for it.
 - In a transaction, a cancelled query is an error, so Postgres aborts the transaction. Roll it back.
 - One token can stop many queries. Use it in the isolate that made it.
 - A transaction started in another isolate does not take a query with a token. It throws a `PgException`.
@@ -135,7 +135,7 @@ await for (PgNativeResult chunk in pool.stream(
 - The query runs on a server-side portal. The driver asks the server for the next chunk only when your listener is ready for it. So only about two chunks are in memory, also for millions of rows.
 - The query starts when you listen. Stop listening (eg. `break` in `await for`, or `.first`) to stop it. Its connection is free again. In a transaction, the stream then ends after the chunk that runs now, with no CancelRequest, so the next query of the transaction is safe.
 - `cancelToken` stops it too. Then the stream fails with `PgQueryCancelledException`.
-- An error (eg. a `PgServerException`) comes as a stream error, then the stream ends.
+- An error (eg. a `PgServerException`) comes as a stream error, then the stream ends. A plan that is out of date after an `ALTER TABLE` is prepared again and sent once more, like `query`, when no chunk came yet.
 - It holds one connection until it ends. A paused listener that waits longer than `requestTimeout` fails the stream with a timeout.
 - It works in a transaction (`transaction: tx`). Other queries of that transaction wait until the stream ends. The stream works only in the isolate that started the transaction.
 

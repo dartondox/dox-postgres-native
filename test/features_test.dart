@@ -293,6 +293,40 @@ void main() {
       two.close();
     });
 
+    test('in a transaction, the cancel never hits the next query', () async {
+      for (int i = 0; i < 150; i++) {
+        int tx = await pool.begin();
+        PgCancelToken token = PgCancelToken();
+        Future<Object?> run(Future<PgNativeResult> f) =>
+            f.then<Object?>((PgNativeResult r) => r, onError: (Object e) => e);
+        Future<Object?> one = run(pool.query('SELECT 1', transaction: tx));
+        Future<Object?> two = run(
+          pool.query('SELECT 2', transaction: tx, cancelToken: token),
+        );
+        Future<Object?> sleep = run(
+          pool.query('SELECT pg_sleep(0.1)', transaction: tx),
+        );
+        await Future<void>.delayed(Duration(microseconds: (i % 15) * 100));
+        token.cancel();
+        expect(await one, isA<PgNativeResult>());
+        Object? b = await two;
+        Object? c = await sleep;
+        // the sleep query is never the one that gets the cancel
+        expect(
+          c,
+          isNot(
+            isA<PgServerException>().having(
+              (PgServerException e) => e.code,
+              'code',
+              '57014',
+            ),
+          ),
+        );
+        if (b is PgNativeResult) expect(c, isA<PgNativeResult>());
+        await pool.rollback(tx);
+      }
+    }, timeout: const Timeout(Duration(minutes: 2)));
+
     test('in a transaction, the transaction is aborted', () async {
       int tx = await pool.begin();
       PgCancelToken token = PgCancelToken();
@@ -451,6 +485,25 @@ void main() {
       // its connection closed: a new one works
       expect((await short.query('SELECT 1 AS n')).rows.single['n'], 1);
       short.close();
+    });
+
+    test('a stale plan after an outside ALTER is sent again', () async {
+      PgNativePool other = openPool('${app}_alter');
+      await other.query('DROP TABLE IF EXISTS pgn_stale');
+      await other.query('CREATE TABLE pgn_stale (n int)');
+      await other.query('INSERT INTO pgn_stale VALUES (1), (2), (3)');
+      String sql = 'SELECT * FROM pgn_stale ORDER BY n';
+      List<PgNativeResult> before = await pool.stream(sql).toList();
+      expect(before.single.columns, <String>['n']);
+      // another pool: this one does not see the schema change
+      await other.query('ALTER TABLE pgn_stale ADD COLUMN m int');
+      List<PgNativeResult> after = await pool
+          .stream(sql, chunkSize: 2)
+          .toList();
+      expect(after.first.columns, <String>['n', 'm']);
+      expect(after.expand((PgNativeResult r) => r.rows).length, 3);
+      await other.query('DROP TABLE pgn_stale');
+      other.close();
     });
 
     test('errors come as a stream error', () async {
