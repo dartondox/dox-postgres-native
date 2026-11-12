@@ -1,7 +1,8 @@
 ## Unreleased
 
 - New: fuzz tests (`cargo fuzz`) for the code that reads bytes from the Postgres server. CI runs them for 60 seconds when `native/` changes. The shipped library only changes in the fix below.
-- Fix: a DataRow with another count of values than the columns of its query is now refused (the connection closes, the query fails). Before, the result record had a wrong shape, and Dart read its rows wrong. A real server never sends this.
+- Fix: a DataRow with another count of values than the columns of its query is now refused (the connection closes, the query fails). Before, the result record had a wrong shape, and Dart read its rows wrong. A real server never sends this. Rows that come before their columns are refused too.
+- Fix: the text of a server error is now decoded with `allowMalformed`. Before, a byte that is not UTF-8 (eg. a message in another encoding) threw a `FormatException` that hid the real error.
 - Fix: a RowDescription with a column name over 65535 bytes is now refused. Before, the length in the result record was cut. A real server never sends this (a name has 63 bytes at most).
 - New: pool settings in `PgNativePool.open` and `fromUrl`. All are optional, and the defaults keep today's behavior.
   - `requestTimeout` (default 300 s): the longest wait for one request. Before, it was fixed at 300 s. The timeout message now says the real value, eg. `timeout, no answer in 30 s`.

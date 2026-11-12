@@ -2,7 +2,7 @@ name: Fuzz
 
 # Runs each fuzz target in native/fuzz for 60 s (inputs up to 64 KB): random
 # bytes as messages from the Postgres server, as a row description with
-# rows, and into the read loop of a connection. A crash or a failed check
+# rows, into the read loop of a connection, and into its login. A crash or a failed check
 # fails the run and uploads the input that caused it.
 
 on:
@@ -26,7 +26,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [messages, rows, conn_read]
+        target: [messages, rows, conn_read, login]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -69,7 +69,7 @@ jobs:
         env:
           TARGET: ${{ matrix.target }}
         run: |
-          mkdir -p "$RUNNER_TEMP/corpus"
+          mkdir -p "$RUNNER_TEMP/corpus" "fuzz/corpus/$TARGET"
           # the prebuilt cargo-fuzz is a musl build and picks musl by
           # default. The sanitizer needs the host (glibc) target.
           host=$(rustc -vV | sed -n 's/^host: //p')

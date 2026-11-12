@@ -347,6 +347,14 @@ fn cols_of<'a>(w: &'a Wait, stmts: &'a HashMap<u64, Stmt>) -> Option<&'a Vec<u8>
     })
 }
 
+/// The count of columns that the rows of `w` must have. Only at the first
+/// row of a chunk, so it stays out of the hot path of the read loop.
+#[cold]
+#[inline(never)]
+fn row_width(w: &Wait, stmts: &HashMap<u64, Stmt>) -> Option<usize> {
+    cols_of(w, stmts).map(|c| usize::from(c[0]) | usize::from(c[1]) << 8)
+}
+
 /// Adds a rows record (status 0 or [CHUNK]) with the rows of `w`.
 fn rows_record(ready: &mut Vec<u8>, w: &Wait, status: u8, stmts: &HashMap<u64, Stmt>) {
     match cols_of(w, stmts) {
@@ -1441,8 +1449,7 @@ impl Conn {
                     // Dart reads the columns for each row, so a row with
                     // another count of values would be read wrong
                     if w.count == 0 {
-                        w.width =
-                            cols_of(w, stmts).map(|c| usize::from(c[0]) | usize::from(c[1]) << 8);
+                        w.width = row_width(w, stmts);
                     }
                     if w.width.is_some_and(|n| be16(body, 0).ok() != Some(n)) {
                         return Err(bad());
@@ -1451,6 +1458,11 @@ impl Conn {
                     w.count += 1;
                 }
                 b'T' | b'n' => {
+                    // rows came before their columns: the record would
+                    // have rows of another width than its columns
+                    if w.count > 0 {
+                        return Err(bad());
+                    }
                     let cols = if tag == b'T' {
                         columns(body)?
                     } else {
@@ -1667,6 +1679,12 @@ mod tests {
         t.extend_from_slice(&23u32.to_be_bytes());
         t.extend_from_slice(&[0; 8]);
         let one = [0, 1, 0, 0, 0, 1, b'x'];
+        // rows before the columns are refused too
+        let mut late = msg(b'1', &[]);
+        late.extend(msg(b'D', &one));
+        late.extend(msg(b'T', &t));
+        late.extend(msg(b'Z', b"I"));
+        assert!(fuzz::feed(&[0], &late, usize::MAX).fail.is_some());
         for (values, ok) in [
             (&[0, 0][..], false),
             (&one[..], true),
@@ -1686,13 +1704,20 @@ mod tests {
         }
     }
 
-    /// The seed files of the fuzz targets must not break a check.
+    /// The seed files of the fuzz targets (all four) must not break a check.
     #[cfg(unix)]
     #[test]
     fn the_fuzz_seeds_pass() {
-        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/fuzz/corpus/conn_read");
-        for f in std::fs::read_dir(dir).unwrap() {
-            fuzz::conn_read(&std::fs::read(f.unwrap().path()).unwrap());
+        let root = concat!(env!("CARGO_MANIFEST_DIR"), "/fuzz/corpus");
+        for (dir, target) in [
+            ("conn_read", fuzz::conn_read as fn(&[u8])),
+            ("login", fuzz::login),
+            ("messages", fuzz::messages),
+            ("rows", fuzz::rows),
+        ] {
+            for f in std::fs::read_dir(format!("{root}/{dir}")).unwrap() {
+                target(&std::fs::read(f.unwrap().path()).unwrap());
+            }
         }
     }
 
@@ -2028,14 +2053,14 @@ pub mod fuzz {
     /// A logged in connection with some requests waiting for an answer,
     /// made from `setup`: one byte per request. The socket is one end of a
     /// pair, and is never read: the bytes come in through `feed`.
-    fn conn(setup: &[u8]) -> (Conn, std::os::unix::net::UnixStream) {
+    fn conn(setup: &[u8], start: State) -> (Conn, std::os::unix::net::UnixStream) {
         let (a, b) = std::os::unix::net::UnixStream::pair().unwrap();
         a.set_nonblocking(true).unwrap();
         let cfg = Config {
             host: "h".into(),
             port: 5432,
             user: "u".into(),
-            password: Vec::new(),
+            password: b"pw".to_vec(),
             dbname: None,
             options: None,
             application_name: None,
@@ -2069,7 +2094,7 @@ pub mod fuzz {
             pool,
             sock: Sock::Unix(mio::net::UnixStream::from_std(a)),
             tls: None,
-            state: State::Ready,
+            state: start,
             next_addr: 0,
             addrs: Vec::new(),
             out: BytesMut::new(),
@@ -2130,13 +2155,21 @@ pub mod fuzz {
         pub(super) ready: Vec<u8>,
         pub(super) fail: Option<(u8, Vec<u8>)>,
         pub(super) waits: usize,
+        /// the bytes to send. Not for a login: a SCRAM nonce is random.
         out: Vec<u8>,
+        /// logged in, and the requests that still wait for it
+        logged_in: bool,
+        pre: usize,
     }
 
     /// Gives `stream` to the read loop `step` bytes at a time (at most the
     /// room `fill` would give), like the socket does.
     pub(super) fn feed(setup: &[u8], stream: &[u8], step: usize) -> Run {
-        let (mut c, _peer) = conn(setup);
+        let (c, _peer) = conn(setup, State::Ready);
+        feed_conn(c, stream, step, true)
+    }
+
+    fn feed_conn(mut c: Conn, stream: &[u8], step: usize, with_out: bool) -> Run {
         let mut ready = Vec::new();
         let mut fail = None;
         let mut p = 0;
@@ -2151,7 +2184,7 @@ pub mod fuzz {
                 break;
             }
             // only a message that is not whole stays in the buffer
-            assert!(c.filled <= p);
+            assert!(matches!(frame(&c.inb[..c.filled], 0), Ok(None)));
             if p == stream.len() {
                 break;
             }
@@ -2160,7 +2193,9 @@ pub mod fuzz {
             ready,
             fail,
             waits: c.waits.len(),
-            out: c.out.to_vec(),
+            out: if with_out { c.out.to_vec() } else { Vec::new() },
+            logged_in: matches!(c.state, State::Ready),
+            pre: c.pre.len(),
         }
     }
 
@@ -2185,6 +2220,66 @@ pub mod fuzz {
         if let Some((1, body)) = &whole.fail {
             check_error_body(body);
         }
+        assert!(whole.ready.len() <= 6 * stream.len() + 64 * n);
+    }
+
+    /// A connection in the login (`State::Auth`), with `n` queries that
+    /// wait for it, and the bytes of the server.
+    fn login_run(n: usize, stream: &[u8], step: usize) -> Run {
+        let (mut c, _peer) = conn(&[], State::Auth(None));
+        let now = Instant::now();
+        let mut ready = Vec::new();
+        for i in 0..n {
+            let req = Request {
+                id: i as u64 + 1,
+                pool: 0,
+                tx: 0,
+                kind: 0,
+                flags: 0,
+                sql: Bytes::from_static(b"select 1"),
+                params: Vec::new(),
+                chunk: 0,
+            };
+            let job = Job::Query(req);
+            c.send(
+                Pending {
+                    id: i as u64 + 1,
+                    job,
+                    at: now,
+                },
+                &mut ready,
+            );
+        }
+        assert_eq!(c.pre.len(), n);
+        feed_conn(c, stream, step, false)
+    }
+
+    /// Bytes from a server during the login (cleartext, MD5 and SCRAM
+    /// requests, the key data, an error), then the first answers. Input:
+    /// byte 0 the size of the pieces, byte 1 how many queries wait (0 to
+    /// 3), then the server bytes.
+    /// - no panic
+    /// - all at once and in pieces give the same records, the same error
+    ///   and the same state
+    /// - the records have the shape Dart reads, an error is one that Dart
+    ///   can read
+    /// - the queries that wait are sent when the login ends, not before
+    pub fn login(data: &[u8]) {
+        let [step, n, stream @ ..] = data else { return };
+        let n = usize::from(*n) % 4;
+        let whole = login_run(n, stream, usize::MAX);
+        let pieces = login_run(n, stream, usize::from(*step) % 64 + 1);
+        assert_eq!(whole, pieces);
+        check_records(&whole.ready);
+        if let Some((1, body)) = &whole.fail {
+            check_error_body(body);
+        }
+        // in the login, or logged in and the queries have gone out
+        assert!(if whole.logged_in {
+            whole.pre == 0
+        } else {
+            whole.pre == n
+        });
         assert!(whole.ready.len() <= 6 * stream.len() + 64 * n);
     }
 }

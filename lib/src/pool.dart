@@ -871,7 +871,12 @@ class _Link {
             done.completeError(PgServerException.fromFields(_fields(b, d, at)));
           case 2:
             done.completeError(
-              PgException(utf8.decode(Uint8List.sublistView(b, at, p))),
+              PgException(
+                utf8.decode(
+                  Uint8List.sublistView(b, at, p),
+                  allowMalformed: true,
+                ),
+              ),
             );
           case 5:
             done.completeError(PgQueryCancelledException());
@@ -912,7 +917,14 @@ class _Link {
         case 5:
           s.fail(PgQueryCancelledException());
         default:
-          s.fail(PgException(utf8.decode(Uint8List.sublistView(b, at, end))));
+          s.fail(
+            PgException(
+              utf8.decode(
+                Uint8List.sublistView(b, at, end),
+                allowMalformed: true,
+              ),
+            ),
+          );
       }
     } catch (error, stack) {
       s.fail(
@@ -929,7 +941,9 @@ class _Link {
     Map<int, String> fields = <int, String>{};
     for (int i = 0; i < count; i++) {
       int len = d.getUint32(at + 1, Endian.little);
-      fields[b[at]] = utf8.decoder.convert(b, at + 5, at + 5 + len);
+      // a bad byte must not hide the real error behind a FormatException
+      fields[b[at]] = const Utf8Decoder(allowMalformed: true)
+          .convert(b, at + 5, at + 5 + len);
       at += 5 + len;
     }
     return fields;

@@ -57,3 +57,10 @@ path = "fuzz_targets/conn_read.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "login"
+path = "fuzz_targets/login.rs"
+test = false
+doc = false
+bench = false

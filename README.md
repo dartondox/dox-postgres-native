@@ -224,7 +224,8 @@ The code that reads bytes from the server has fuzz targets in `native/fuzz/`. CI
 
 - `messages`: random bytes as a stream of backend messages. It cuts the frames with `frame` and runs `columns`, `row`, `error_body` and `error_code` on each body. All at once and in small pieces must give the same result. Where the `postgres-protocol` crate reads a DataRow, a RowDescription or an ErrorResponse without an error, our parser must give the same values.
 - `rows`: a RowDescription and DataRows built from the input, made into a rows record with `rows_record`. The record must have the exact shape that Dart reads (`_rows` in `lib/src/pool.dart`): its lengths match what follows, and it ends where the length says.
-- `conn_read`: the real read loop of a connection (`Conn::messages`), with some requests waiting (queries, a stream, BEGIN, COMMIT), fed with server bytes. No panic. All at once and in pieces give the same records, the same error and the same bytes to send. Every record `ready` has the shape Dart reads. The records are not much bigger than the input. A DataRow with another count of values than the columns is refused.
+- `conn_read`: the real read loop of a connection (`Conn::messages`), with some requests waiting (queries, a stream, BEGIN, COMMIT), fed with server bytes. No panic. All at once and in pieces give the same records, the same error and the same bytes to send. Every record `ready` has the shape Dart reads. The records are not much bigger than the input. A DataRow with another count of values than the columns, or rows before their columns, is refused.
+- `login`: the login of a connection (`Conn::messages` in the `Auth` state): cleartext, MD5 and SCRAM requests, key data, errors, with queries waiting. No panic. All at once and in pieces give the same records, the same error and the same state. The waiting queries are sent when the login ends, not before.
 
 To run one locally:
 
@@ -233,10 +234,11 @@ rustup toolchain install nightly
 cargo install cargo-fuzz --locked
 cd native
 cp Cargo.lock fuzz/Cargo.lock
-mkdir -p /tmp/corpus/messages /tmp/corpus/rows /tmp/corpus/conn_read
+mkdir -p /tmp/corpus/messages /tmp/corpus/rows /tmp/corpus/conn_read /tmp/corpus/login
 cargo +nightly fuzz run messages /tmp/corpus/messages fuzz/corpus/messages -- -max_total_time=300 -max_len=65536
 cargo +nightly fuzz run rows /tmp/corpus/rows fuzz/corpus/rows -- -max_total_time=300 -max_len=65536
 cargo +nightly fuzz run conn_read /tmp/corpus/conn_read fuzz/corpus/conn_read -- -max_total_time=300 -max_len=65536
+cargo +nightly fuzz run login /tmp/corpus/login fuzz/corpus/login -- -max_total_time=300 -max_len=65536
 ```
 
 - The first folder gets the new inputs the fuzzer finds. Use a temp folder, so `fuzz/corpus/` keeps only the small seed files. Commit a new seed there only when it is useful.
