@@ -69,7 +69,7 @@ pub use conn::fuzz;
 use conn::Conn;
 
 /// Bump when the FFI functions or the record layout change.
-const ABI_VERSION: i32 = 6;
+const ABI_VERSION: i32 = 7;
 const REQ_HEAD: usize = 32;
 const RES_HEAD: usize = 13;
 /// Statements kept per connection. Over this, the one used longest ago is
