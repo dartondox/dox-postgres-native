@@ -5,7 +5,7 @@ repository: https://github.com/dartondox/dox-postgres-native
 homepage: https://dartondox.dev
 
 environment:
-  sdk: ^3.14.0
+  sdk: ^3.13.0
 
 dependencies:
   code_assets: ^2.1.0
