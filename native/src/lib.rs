@@ -450,6 +450,15 @@ struct Pool {
     closed: AtomicBool,
     /// the count of links in `state.waiting`, read without the lock
     wanted: AtomicUsize,
+    /// links that hold connections of this pool or wait for one. The fair
+    /// share of one link is max / active, at least 1.
+    active: AtomicUsize,
+    /// busy links under their fair share that found the pool full: links
+    /// over their share give connections back to them
+    hungry: AtomicUsize,
+    /// busy links that found the pool full (also the hungry ones): links
+    /// with idle connections give them to the pool
+    greedy: AtomicUsize,
     /// the request timeout in ms (tests make it shorter)
     timeout_ms: AtomicU64,
     /// a free connection older than this is closed. None: no limit.
@@ -822,6 +831,9 @@ pub unsafe extern "C" fn dpg_connect(
             cfg: config,
             closed: AtomicBool::new(false),
             wanted: AtomicUsize::new(0),
+            active: AtomicUsize::new(0),
+            hungry: AtomicUsize::new(0),
+            greedy: AtomicUsize::new(0),
             timeout_ms: AtomicU64::new(timeout_ms),
             max_age,
             idle,

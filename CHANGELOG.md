@@ -1,3 +1,7 @@
+## Unreleased
+
+- Fix: slow requests when several isolates share a full pool. When one isolate waited for a connection, every other isolate stopped using its idle connections and sent all new queries down one connection. Under steady load all isolates did this at the same time, and connections moved back and forth between them. So some requests waited behind many others (p99 went from about 28 ms with 1 isolate to 34-60 ms with 2). Now each isolate has a fair share of the pool: `maxConnections` / isolates that use it, at least 1. An isolate at or under its share works as normal: it uses its idle connections and spreads queries on the least busy one. Only an isolate over its share gives connections back, when another isolate needs them. The share only limits what an isolate takes from busy isolates: a connection that another isolate did not use for 50 ms goes to any isolate that needs more, also over its share, and it goes back when the first isolate gets busy again. An isolate with no connection, or with all its connections in transactions, still always gets one. The limit for the whole process does not change.
+
 ## 3.2.0
 
 - New: fuzz tests (`cargo fuzz`) for the code that reads bytes from the Postgres server. CI runs them for 60 seconds when `native/` changes. The shipped library only changes in the fix below.
