@@ -755,6 +755,9 @@ impl Core {
             let need = queued && (n < share || l.stuck(conns, l.keep()));
             // greedy: busy, and the pool was full. It stays greedy until
             // it has nothing to do. Hungry: greedy under its share.
+            // ponytail: a busy greedy link that does not wait gets a free
+            // pool connection on its next request only, as `Pool::wake` wakes
+            // the waiting links. The delay is bounded, no deadlock.
             let greedy = (l.greedy || l.full)
                 && l.conns
                     .iter()
@@ -802,7 +805,7 @@ impl Core {
             let shut = l.pool.closed.load(Ordering::Acquire);
             let keep = if shut { 0 } else { l.keep() };
             let now = (!shut && l.gives()).then(Instant::now);
-            if l.conns.len() <= keep && now.is_none() {
+            if !shut && l.conns.len() <= keep && now.is_none() {
                 return true;
             }
             let mut give = Vec::new();
@@ -997,7 +1000,9 @@ impl Core {
             .flat_map(|l| &l.conns)
             .filter_map(|&i| self.conns[i].as_ref())
             .filter(|c| c.idle())
-            .filter_map(|c| c.unused_since.map(|t| t + SPARE));
+            // no stamp yet (`wait_turns` just made the link give): due now,
+            // so the next run stamps it. Without this no timer would exist.
+            .map(|c| c.unused_since.map_or_else(Instant::now, |t| t + SPARE));
         conns.chain(queues).chain(spare).min()
     }
 
@@ -1007,9 +1012,10 @@ impl Core {
         if !self.foreign.is_empty() {
             self.route();
         }
+        // before the share: a connection that gets idle here is given now
+        self.settle_cancels();
         self.share();
         self.wait_turns();
-        self.settle_cancels();
         self.flush_all();
         // after the flush: the query is on its way before its cancel
         self.cancels();

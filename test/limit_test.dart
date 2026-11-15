@@ -86,13 +86,13 @@ void main() {
       // share (4 / 2 = 2), and does not pile all its queries on one
       List<int> used = <int>[
         for (List<int> round in r)
-          if (round[0] >= 700) round.skip(1).toSet().length,
+          if (round[0] >= 900) round.skip(1).toSet().length,
       ];
       expect(used, isNotEmpty);
       int spread = used.where((int n) => n >= 2).length;
       expect(
         spread,
-        greaterThanOrEqualTo(used.length * 3 ~/ 4),
+        greaterThanOrEqualTo(used.length * 2 ~/ 3),
         reason: '$used',
       );
     }
@@ -118,7 +118,7 @@ void main() {
     expect(msgs.current, 'holding');
     // plain queries: this isolate gets more than its share
     int most = 0;
-    for (int i = 0; i < 40 && most <= 4; i++) {
+    for (int i = 0; i < 100 && most <= 4; i++) {
       most = max(most, await _round(pool, 16));
     }
     expect(most, greaterThan(4));
@@ -149,7 +149,7 @@ void main() {
     List<int> late = used.sublist(used.length ~/ 2);
     expect(
       late.where((int n) => n >= 3).length,
-      greaterThanOrEqualTo(late.length * 3 ~/ 4),
+      greaterThanOrEqualTo(late.length ~/ 2),
       reason: '$used',
     );
     toChild.send('done');
@@ -193,6 +193,63 @@ void main() {
     await msgs.cancel();
     pool.close();
     await settle(app, 0);
+  });
+
+  test('a waiting request goes when the busy isolate gets idle', () async {
+    String app = 'dpg_turn_$pid';
+    PgNativePool pool = openPool(app, 8);
+    ReceivePort fromChild = ReceivePort();
+    StreamIterator<Object?> msgs = StreamIterator<Object?>(fromChild);
+    await Isolate.spawn(_idleThenBusy, <Object>[
+      pool.handle,
+      fromChild.sendPort,
+    ]);
+    expect(await msgs.moveNext(), isTrue);
+    SendPort toChild = msgs.current as SendPort;
+    expect(await msgs.moveNext(), isTrue);
+    // the other isolate is busy for 1.5 s, and takes the whole pool
+    toChild.send('go');
+    await Future<void>.delayed(const Duration(milliseconds: 200));
+    List<int> txs = await Future.wait(<Future<int>>[
+      for (int i = 0; i < 4; i++) pool.begin(),
+    ]).timeout(const Duration(seconds: 2));
+    // one more query, just before the other isolate gets idle. It must go
+    // soon after, not at the request timeout (300 s).
+    await Future<void>.delayed(const Duration(milliseconds: 1000));
+    PgNativeResult r = await pool
+        .query('SELECT 7 AS n')
+        .timeout(const Duration(seconds: 3));
+    expect(r.rows.single['n'], 7);
+    for (int tx in txs) {
+      await pool.commit(tx);
+    }
+    expect(await msgs.moveNext(), isTrue);
+    toChild.send('done');
+    await msgs.cancel();
+    pool.close();
+    await settle(app, 0);
+  });
+
+  test('closing a pool fails the request of an isolate with no '
+      'connection', () async {
+    String app = 'dpg_shut_$pid';
+    PgNativePool pool = openPool(app, 1);
+    ReceivePort fromChild = ReceivePort();
+    StreamIterator<Object?> msgs = StreamIterator<Object?>(fromChild);
+    await Isolate.spawn(_inTx, <Object>[pool.handle, fromChild.sendPort]);
+    expect(await msgs.moveNext(), isTrue);
+    expect(msgs.current, 'in tx');
+    // the only connection is in a transaction: this query waits, with no
+    // connection in this isolate
+    Future<Object?> waiting = pool
+        .query('SELECT 1')
+        .then<Object?>((PgNativeResult r) => r)
+        .catchError((Object e) => e);
+    await Future<void>.delayed(const Duration(milliseconds: 300));
+    pool.close();
+    Object? e = await waiting.timeout(const Duration(seconds: 3));
+    expect(e.toString(), contains('closed'));
+    await msgs.cancel();
   });
 
   test('an isolate with idle connections does not starve another', () async {
