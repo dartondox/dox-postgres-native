@@ -2082,6 +2082,8 @@ pub mod fuzz {
             tls: None,
             closed: AtomicBool::new(false),
             wanted: AtomicUsize::new(0),
+            active: AtomicUsize::new(0),
+            hungry: AtomicUsize::new(0),
             timeout_ms: AtomicU64::new(1000),
             max_age: None,
             idle: None,

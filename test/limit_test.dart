@@ -72,6 +72,34 @@ void main() {
     await settle(app, 0);
   });
 
+  test('two busy isolates each keep their share of a full pool', () async {
+    String app = 'dpg_fair_$pid';
+    PgNativePool pool = openPool(app, 4);
+    int handle = pool.handle;
+    // the first one takes the whole pool, then the second one comes
+    List<List<List<int>>> runs = await Future.wait(<Future<List<List<int>>>>[
+      for (int w = 0; w < 2; w++) Isolate.run(_spread(handle, w * 300)),
+    ]).timeout(const Duration(seconds: 30));
+    for (List<List<int>> r in runs) {
+      // once both are busy (from 700 ms), each round spreads on about its
+      // share (4 / 2 = 2), and does not pile all its queries on one
+      List<int> used = <int>[
+        for (List<int> round in r)
+          if (round[0] >= 700) round.skip(1).toSet().length,
+      ];
+      expect(used, isNotEmpty);
+      int spread = used.where((int n) => n >= 2).length;
+      expect(
+        spread,
+        greaterThanOrEqualTo(used.length * 3 ~/ 4),
+        reason: '$used',
+      );
+    }
+    expect(await count(app), lessThanOrEqualTo(4));
+    pool.close();
+    await settle(app, 0);
+  });
+
   test('an isolate with idle connections does not starve another', () async {
     String app = 'dpg_starve_$pid';
     PgNativePool pool = openPool(app, 2);
@@ -259,6 +287,31 @@ Future<int> _sleepyRun(int handle, int w) async {
   }
   return sum;
 }
+
+/// runs in another isolate: after [wait] ms, rounds of 8 queries at once
+/// until 1.8 s after the start. Gives each round as [ms since the start,
+/// the server pid of each query].
+Future<List<List<int>>> _spreadRun(int handle, int wait) async {
+  Stopwatch time = Stopwatch()..start();
+  await Future<void>.delayed(Duration(milliseconds: wait));
+  PgNativePool pool = PgNativePool.fromHandle(handle);
+  List<List<int>> rounds = <List<int>>[];
+  while (time.elapsedMilliseconds < 1800) {
+    List<PgNativeResult> res = await Future.wait(<Future<PgNativeResult>>[
+      for (int i = 0; i < 8; i++)
+        pool.query('SELECT pg_backend_pid() AS p, pg_sleep(0.005)'),
+    ]);
+    rounds.add(<int>[
+      time.elapsedMilliseconds,
+      for (PgNativeResult r in res) r.rows.single['p'] as int,
+    ]);
+  }
+  return rounds;
+}
+
+/// a closure with only [handle] and [wait], so it can go to another isolate
+Future<List<List<int>>> Function() _spread(int handle, int wait) =>
+    () => _spreadRun(handle, wait);
 
 /// a closure with only [handle] and [w], so it can go to another isolate
 Future<int> Function() _sleepy(int handle, int w) =>
