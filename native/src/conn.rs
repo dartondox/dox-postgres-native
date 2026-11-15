@@ -550,6 +550,9 @@ pub(crate) struct Conn {
     last: Instant,
     /// when it was opened, for the max age of the pool
     born: Instant,
+    /// set by the link while it is idle and another link wants one; any
+    /// new request clears it (see `share` in link.rs)
+    pub unused_since: Option<Instant>,
     /// the process id and secret key of the backend, for a CancelRequest
     key: Option<(i32, i32)>,
     /// the last CancelRequest: done (the server closed its socket), and
@@ -596,6 +599,7 @@ impl Conn {
                         tx: None,
                         last: now,
                         born: now,
+                        unused_since: None,
                         key: None,
                         cancel: None,
                         streams: 0,
@@ -874,6 +878,7 @@ impl Conn {
     /// before it are done, and the ones after it wait until it is done.
     /// So its CancelRequest can only stop it.
     pub fn send(&mut self, p: Pending, ready: &mut Vec<u8>) {
+        self.unused_since = None;
         if !matches!(self.state, State::Ready)
             || !self.pre.is_empty()
             || self.streaming()
@@ -2084,6 +2089,7 @@ pub mod fuzz {
             wanted: AtomicUsize::new(0),
             active: AtomicUsize::new(0),
             hungry: AtomicUsize::new(0),
+            greedy: AtomicUsize::new(0),
             timeout_ms: AtomicU64::new(1000),
             max_age: None,
             idle: None,
@@ -2112,6 +2118,7 @@ pub mod fuzz {
             tx: None,
             last: now,
             born: now,
+            unused_since: None,
             key: None,
             cancel: None,
             streams: 0,

@@ -63,28 +63,37 @@
 //! counts the connections of all links (`open`). Each link has a fair
 //! share: max / links that hold connections or wait, at least 1 (`active`
 //! of the pool).
-//! - A link that needs a connection and has none it can use (or needs one
-//!   for a begin, a stream or a cancellable query) and finds the pool full
-//!   keeps its requests (`queue`). Under its share it joins the `waiting`
-//!   list of the pool. At its share it waits for its own connections.
-//! - A busy link under its share that finds the pool full pipelines on its
-//!   own connections, and counts itself `hungry` in the pool.
+//! - A link whose requests can not go now keeps them (`queue`). It joins
+//!   the `waiting` list of the pool when it is under its share, or when
+//!   none of the connections it keeps can take them (all in transactions
+//!   or used alone). Else its own connections drain and take them.
+//! - A busy link that finds the pool full pipelines on its own
+//!   connections and counts itself `greedy` in the pool; under its share
+//!   also `hungry`.
 //! - When another link waits or is hungry, a link keeps only its share:
 //!   new requests go to its first `share` connections, the others get no
 //!   new request, drain, and go to the `idle` list of the pool
-//!   (deregistered from its poll). It opens no new one. An idle link is
-//!   asked by its helper (`share_all`).
+//!   (deregistered from its poll). It opens no new one. When the pool has
+//!   no free connection for a waiting link, the others keep one less than
+//!   they have (at least 1, or 0 when the pool has fewer connections than
+//!   links), so a link with all its share in transactions still gets one
+//!   and no link starves.
 //! - A link at or under its share works as if nobody waits: it uses its
 //!   idle connections and pipelines on the least busy one. So two busy
 //!   links each keep about half the pool, and connections do not move to
 //!   and fro between them.
-//! - A pool with fewer connections than links: while a link waits, the
-//!   others keep one less than they have, so the connections go round and
-//!   no link starves.
+//! - The share only limits what a link takes from busy links. When
+//!   another link wants one (waits or is greedy), a connection that was
+//!   not used for [SPARE] goes to the pool, so any link may take it, also
+//!   over its share. It drains back when its first link is hungry again.
+//! - Idle links are asked by their helper (`share_all`). A timer runs
+//!   `share` again when an idle connection becomes spare.
 //! - A waiting link takes a connection from the pool `idle` list (or opens
-//!   a new one when one closed) in the order of the `waiting` list. It
-//!   registers it in its own poll and sends all its waiting requests. A
-//!   hungry link takes one on its next request, after the waiting links.
+//!   a new one when one closed) in the order of the `waiting` list, also
+//!   over its share. It registers it in its own poll and sends its waiting
+//!   requests. Each change of the list while a connection is free wakes
+//!   the waiting links. A greedy link takes one on its next request, after
+//!   the waiting links.
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak};
@@ -101,6 +110,11 @@ use crate::{
 
 /// How often the helper checks that the isolate is alive.
 const PROBE: Duration = Duration::from_millis(100);
+/// An idle connection not used for this long goes to another link that
+/// wants one, also over the fair share of that link. Shorter gaps of a busy
+/// link keep their connection, so connections do not move to and fro.
+/// ponytail: fixed; make it a pool setting if apps need another value.
+const SPARE: Duration = Duration::from_millis(50);
 /// An empty result buffer bigger than this is made small again.
 const BIG_BUF: usize = 1 << 20;
 
@@ -223,6 +237,8 @@ struct Local {
     active: bool,
     /// counted in `hungry` of the pool
     hungry: bool,
+    /// counted in `greedy` of the pool
+    greedy: bool,
 }
 
 impl Local {
@@ -238,24 +254,43 @@ impl Local {
         (self.pool.max / active).max(1)
     }
 
+    /// Another link waits, or is busy and found the pool full: it may
+    /// take the connections this link does not use.
+    fn others_want(&self) -> bool {
+        self.others_wait() || self.pool.greedy.load(Ordering::Relaxed) > usize::from(self.greedy)
+    }
+
+    /// Another link wants a connection, and this one does not: its
+    /// connections not used for [SPARE] go to the pool.
+    fn gives(&self) -> bool {
+        !self.greedy && !self.waiting && self.others_want()
+    }
+
+    /// The links that wait are more than the free connections of the pool.
+    fn short(&self) -> bool {
+        let st = self.pool.state.lock().unwrap();
+        st.idle.len() + self.pool.max.saturating_sub(st.open) < st.waiting.len()
+    }
+
     /// How many of its connections the link uses now: the first ones of
     /// `conns`. The others get no new request, drain, and go to the pool.
     /// - Another link waits or is hungry: the share. Then the links hold
-    ///   at most max - share, so the waiting one gets a connection.
-    /// - Another link waits, and the pool has fewer connections than
-    ///   links: one less than now, so the connections go round.
+    ///   at most max - share, so a waiting link gets a connection.
+    /// - Another link waits, and the pool has no free connection for it:
+    ///   one less than now (at least 1, or 0 when the pool has fewer
+    ///   connections than links), so a link whose connections are all in
+    ///   transactions still gets one, and the connections go round.
     /// - Else: all, and it may open more.
-    ///
-    /// ponytail: a link at its share whose connections are all in
-    /// transactions waits for its own for one more begin. Give one back
-    /// here too if apps need more transactions than their share.
     fn keep(&self) -> usize {
+        let n = self.conns.len();
         if self.others_wait() {
-            let active = self.pool.active.load(Ordering::Relaxed);
-            if self.pool.max < active {
-                self.conns.len().saturating_sub(1)
+            let share = self.share();
+            if !self.short() {
+                share
+            } else if self.pool.max < self.pool.active.load(Ordering::Relaxed) {
+                n.saturating_sub(1)
             } else {
-                self.share()
+                share.min(n.saturating_sub(1)).max(1)
             }
         } else if self.pool.hungry.load(Ordering::Relaxed) > usize::from(self.hungry) {
             self.share()
@@ -264,8 +299,19 @@ impl Local {
         }
     }
 
-    /// Counts the link in `active` and `hungry` of the pool, or not.
-    fn count(&mut self, active: bool, hungry: bool) {
+    /// None of the connections it keeps can take a request now or after
+    /// its current ones: all are in transactions or used alone.
+    fn stuck(&self, conns: &[Option<Conn>], keep: usize) -> bool {
+        !self.conns.iter().take(keep).any(|&i| {
+            conns[i]
+                .as_ref()
+                .is_some_and(|c| c.tx.is_none() && !c.exclusive())
+        })
+    }
+
+    /// Counts the link in `active`, `hungry` and `greedy` of the pool, or
+    /// not.
+    fn count(&mut self, active: bool, hungry: bool, greedy: bool) {
         fn set(on: &mut bool, to: bool, n: &AtomicUsize) {
             if *on != to {
                 *on = to;
@@ -278,6 +324,7 @@ impl Local {
         }
         set(&mut self.active, active, &self.pool.active);
         set(&mut self.hungry, hungry, &self.pool.hungry);
+        set(&mut self.greedy, greedy, &self.pool.greedy);
     }
 
     /// Link `id` stops using this pool: it leaves the `waiting` list and
@@ -290,7 +337,7 @@ impl Local {
             Pool::wake(&st);
             self.waiting = false;
         }
-        self.count(false, false);
+        self.count(false, false, false);
     }
 }
 
@@ -448,6 +495,7 @@ impl Core {
                 grew: false,
                 active: false,
                 hungry: false,
+                greedy: false,
             });
         }
         self.pools
@@ -634,9 +682,10 @@ impl Core {
             .take(keep)
             .copied()
             .find(|&i| conns[i].as_ref().is_some_and(|c| c.idle() && !c.old(p.at)));
-        // 2. one more connection, while under `keep`. A link with none may
-        // always ask: `grow` keeps the order of the waiting links.
-        if pick.is_none() && !l.full && (l.conns.len() < keep || l.conns.is_empty()) {
+        // 2. one more connection, while under `keep`. A waiting link, or
+        // one with none, may always ask: `grow` keeps the order of the
+        // waiting links.
+        if pick.is_none() && !l.full && (l.waiting || l.conns.len() < keep || l.conns.is_empty()) {
             match grow(*id, l, conns, poll.registry(), p.at) {
                 Grow::Conn(i) => pick = Some(i),
                 Grow::Full => l.full = true,
@@ -685,7 +734,7 @@ impl Core {
 
     /// Joins or leaves the `waiting` list of each pool. A link that got a
     /// connection and still waits goes to the end of the list. Also counts
-    /// the link in `active` and `hungry` of the pool.
+    /// the link in `active`, `hungry` and `greedy` of the pool.
     fn wait_turns(&mut self) {
         let Core {
             id,
@@ -699,19 +748,20 @@ impl Core {
         for l in pools.values_mut() {
             let (n, share) = (l.conns.len(), l.share());
             let queued = !l.queue.is_empty();
-            // waits: requests wait and it has less than its share. At its
-            // share it waits for its own connections: it is not first in
-            // line for one it would not take (see `keep`).
-            let need = queued && n < share;
-            // hungry: under its share, busy, and the pool was full. It
-            // stays hungry until it has its share or nothing to do.
-            let hungry = n < share
-                && (l.hungry || l.full)
+            // waits: requests wait, and it is under its share or none of
+            // the connections it keeps can take them. Else its own
+            // connections drain and take them: no new request goes to
+            // them while the queue is not empty.
+            let need = queued && (n < share || l.stuck(conns, l.keep()));
+            // greedy: busy, and the pool was full. It stays greedy until
+            // it has nothing to do. Hungry: greedy under its share.
+            let greedy = (l.greedy || l.full)
                 && l.conns
                     .iter()
                     .any(|&i| conns[i].as_ref().is_some_and(|c| c.load() > 0));
-            ask |= hungry && !l.hungry;
-            l.count(n > 0 || queued, hungry);
+            let hungry = greedy && n < share;
+            ask |= (greedy && !l.greedy) || (hungry && !l.hungry);
+            l.count(n > 0 || queued, hungry, greedy);
             if need == l.waiting && !(need && l.grew) {
                 continue;
             }
@@ -719,14 +769,13 @@ impl Core {
             st.waiting.retain(|w| w.0 != id);
             if need {
                 st.waiting.push_back((id, me.clone()));
-                // a connection came free before this link joined: try
-                // again at once, nobody else wakes it for that one
-                let spare = st.idle.len() + l.pool.max.saturating_sub(st.open);
-                if spare >= st.waiting.len()
-                    && let Some(me) = me.upgrade()
-                {
-                    me.nudge();
-                }
+            }
+            // a connection is free: the links that wait try again at once.
+            // Nobody else wakes them for it: it came free before this link
+            // joined, or this link left (or went to the end) before the
+            // ones behind it got their turn.
+            if st.idle.len() + l.pool.max.saturating_sub(st.open) > 0 {
+                Pool::wake(&st);
             }
             l.pool.wanted.store(st.waiting.len(), Ordering::Relaxed);
             ask |= need && !l.waiting;
@@ -737,8 +786,9 @@ impl Core {
         }
     }
 
-    /// Gives the idle connections over `keep` to the pool (another link
-    /// waits or is hungry), and closes the connections of closed pools.
+    /// Gives connections to the pool: the idle ones over `keep` (another
+    /// link waits or is hungry), and the ones not used for [SPARE] (another
+    /// link wants one). Closes the connections of closed pools.
     fn share(&mut self) {
         let Core {
             id,
@@ -751,25 +801,29 @@ impl Core {
         pools.retain(|_, l| {
             let shut = l.pool.closed.load(Ordering::Acquire);
             let keep = if shut { 0 } else { l.keep() };
-            let mut over = l.conns.len().saturating_sub(keep);
-            if over == 0 {
+            let now = (!shut && l.gives()).then(Instant::now);
+            if l.conns.len() <= keep && now.is_none() {
                 return true;
             }
             let mut give = Vec::new();
             // the last ones first: the first `keep` take the new requests
             let mut j = l.conns.len();
-            while j > 0 && over > 0 {
+            while j > 0 {
                 j -= 1;
                 let i = l.conns[j];
-                let c = conns[i].as_ref().unwrap();
+                let c = conns[i].as_mut().unwrap();
                 // a closed pool: also a connection that is not logged in
                 // yet, when nothing waits on it
-                if c.idle() || (shut && c.load() == 0 && c.tx.is_none()) {
+                let free = c.idle() || (shut && c.load() == 0 && c.tx.is_none());
+                let unused = c.idle()
+                    && now.is_some_and(|now| {
+                        now.saturating_duration_since(*c.unused_since.get_or_insert(now)) >= SPARE
+                    });
+                if (free && l.conns.len() > keep) || unused {
                     l.conns.remove(j);
                     let mut c = conns[i].take().unwrap();
                     c.deregister(poll.registry());
                     give.push(c);
-                    over -= 1;
                 }
             }
             if shut {
@@ -935,7 +989,16 @@ impl Core {
             .pools
             .values()
             .filter_map(|l| l.queue.front().map(|p| p.at + l.pool.timeout()));
-        conns.chain(queues).min()
+        // an idle connection another link wants: when it is spare
+        let spare = self
+            .pools
+            .values()
+            .filter(|l| l.gives())
+            .flat_map(|l| &l.conns)
+            .filter_map(|&i| self.conns[i].as_ref())
+            .filter(|c| c.idle())
+            .filter_map(|c| c.unused_since.map(|t| t + SPARE));
+        conns.chain(queues).chain(spare).min()
     }
 
     /// The end of each call: give or take connections, write, set the
