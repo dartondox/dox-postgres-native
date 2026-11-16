@@ -12,3 +12,9 @@ updates:
     directory: "/native"
     schedule:
       interval: weekly
+    ignore:
+      # postgres-protocol 0.6.x uses fallible-iterator 0.2. Our code calls
+      # its iterators through that trait, so 0.3 does not compile (#26).
+      # Remove this when postgres-protocol moves to 0.3.
+      - dependency-name: fallible-iterator
+        versions: [">=0.3.0"]
