@@ -9,7 +9,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 bytes = "1.12.1"
-fallible-iterator = "0.2.0"
+fallible-iterator = "0.3.0"
 mio = { version = "1.2.4", features = ["os-poll", "net"] }
 postgres-protocol = "0.6.12"
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
