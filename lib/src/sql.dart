@@ -15,21 +15,28 @@ class ParsedSql {
   static final Map<String, ParsedSql> _named = <String, ParsedSql>{};
   static final Map<String, ParsedSql> _direct = <String, ParsedSql>{};
 
+  /// SQL longer than this is parsed each time, not cached. Big generated
+  /// SQL (eg. an insert of many rows, with another row count each time)
+  /// would fill the caches with hundreds of MB.
+  static const int maxCachedLength = 4096;
+
   /// Parses [sql] with `@name` parameters.
   static ParsedSql named(String sql) {
     ParsedSql? hit = _named[sql];
     if (hit != null) return hit;
+    List<String> names = <String>[];
+    ParsedSql parsed = ParsedSql._(rewrite(sql, names), names);
+    if (sql.length > maxCachedLength) return parsed;
     // ponytail: a simple clear, an LRU if apps send many different queries
     if (_named.length > 1024) _named.clear();
-    List<String> names = <String>[];
-    String out = rewrite(sql, names);
-    return _named[sql] = ParsedSql._(out, names);
+    return _named[sql] = parsed;
   }
 
   /// [sql] as it is, with `$1, $2...` parameters.
   static ParsedSql direct(String sql) {
     ParsedSql? hit = _direct[sql];
     if (hit != null) return hit;
+    if (sql.length > maxCachedLength) return ParsedSql._(sql, null);
     if (_direct.length > 1024) _direct.clear();
     return _direct[sql] = ParsedSql._(sql, null);
   }

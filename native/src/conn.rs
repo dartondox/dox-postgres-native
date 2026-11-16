@@ -536,6 +536,10 @@ pub(crate) struct Conn {
     inb: Vec<u8>,
     filled: usize,
     stmts: HashMap<u64, Stmt>,
+    /// statements dropped from `stmts` after an error that the server may
+    /// still have. The next query sends a Close for each, before its own
+    /// messages, so the server frees them.
+    closing: Vec<String>,
     tick: u64,
     names: u64,
     waits: VecDeque<Wait>,
@@ -591,6 +595,7 @@ impl Conn {
                         inb: Vec::new(),
                         filled: 0,
                         stmts: HashMap::new(),
+                        closing: Vec::new(),
                         tick: 0,
                         names: 0,
                         waits: VecDeque::new(),
@@ -918,6 +923,7 @@ impl Conn {
         let Conn {
             pool,
             stmts,
+            closing,
             out,
             waits,
             spare,
@@ -956,6 +962,11 @@ impl Conn {
         let start = out.len();
         let written = (|| -> Result<(), String> {
             let e = |e: std::io::Error| e.to_string();
+            // after the Sync of the query that dropped them, so the server
+            // runs them; a name the server does not have is no error
+            for n in closing.iter() {
+                frontend::close(b'S', n, out).map_err(e)?;
+            }
             if let Some((_, old)) = &evicted {
                 frontend::close(b'S', &old.name, out).map_err(e)?;
             }
@@ -996,12 +1007,15 @@ impl Conn {
             }
             return Err(Fail(2, e.into_bytes()));
         }
+        closing.clear();
         if let Some(name) = new_name {
             stmts.insert(
                 k,
                 Stmt {
                     name,
-                    sql: req.sql.clone(),
+                    // its own copy: `req.sql` is a slice of the whole
+                    // batch from Dart, which would stay alive with it
+                    sql: Bytes::copy_from_slice(&req.sql),
                     oids: req.params.iter().map(|p| p.oid).collect(),
                     schema,
                     cols: None,
@@ -1428,6 +1442,7 @@ impl Conn {
             filled,
             out,
             stmts,
+            closing,
             waits,
             spare,
             tx,
@@ -1488,12 +1503,16 @@ impl Conn {
                     if let Kind::Query { stmt, parsing, req } = &w.kind {
                         let code = error_code(body);
                         let stale = code == GONE || code == STALE;
+                        // its Parse failed (it has no columns yet), or it is
+                        // out of date: the next query prepares it again. A
+                        // statement whose Bind or Execute failed (eg. a
+                        // unique violation) is fine and stays.
                         if let Some(k) = stmt
-                            && (*parsing || stale)
+                            && (stale || *parsing && stmts.get(k).is_some_and(|s| s.cols.is_none()))
+                            && let Some(s) = stmts.remove(k)
                         {
-                            // its Parse failed, or it is out of date: the
-                            // next query prepares it again
-                            stmts.remove(k);
+                            // the server may still have it
+                            closing.push(s.name);
                         }
                         // sent again only if the connection is idle after it
                         // (see GONE and the ReadyForQuery below)
@@ -2110,6 +2129,7 @@ pub mod fuzz {
             inb: Vec::new(),
             filled: 0,
             stmts: HashMap::new(),
+            closing: Vec::new(),
             tick: 0,
             names: 0,
             waits: VecDeque::new(),
@@ -2290,5 +2310,137 @@ pub mod fuzz {
             whole.pre == n
         });
         assert!(whole.ready.len() <= 6 * stream.len() + 64 * n);
+    }
+
+    #[cfg(test)]
+    mod stmt_tests {
+        use super::*;
+
+        fn msg(tag: u8, body: &[u8]) -> Vec<u8> {
+            let mut m = vec![tag];
+            m.extend_from_slice(&(body.len() as u32 + 4).to_be_bytes());
+            m.extend_from_slice(body);
+            m
+        }
+
+        fn error(code: &str) -> Vec<u8> {
+            msg(b'E', format!("SERROR\0C{code}\0Mboom\0\0").as_bytes())
+        }
+
+        fn query(c: &mut Conn, id: u64, sql: Bytes) {
+            let req = Request {
+                id,
+                pool: 0,
+                tx: 0,
+                kind: 0,
+                flags: 0,
+                sql,
+                params: Vec::new(),
+                chunk: 0,
+            };
+            c.encode(id, req, Instant::now(), false).unwrap();
+        }
+
+        fn read(c: &mut Conn, stream: &[u8]) -> Vec<u8> {
+            Conn::room(&mut c.inb, c.filled);
+            c.inb[..stream.len()].copy_from_slice(stream);
+            c.filled = stream.len();
+            let mut ready = Vec::new();
+            c.messages(&mut ready).unwrap();
+            ready
+        }
+
+        /// Does `out` have a Close of statement `name`?
+        fn closes(out: &[u8], name: &str) -> bool {
+            let m = msg(b'C', format!("S{name}\0").as_bytes());
+            out.windows(m.len()).any(|w| w == m.as_slice())
+        }
+
+        #[test]
+        fn a_cached_statement_does_not_keep_the_batch() {
+            let (mut c, _peer) = conn(&[], State::Ready);
+            let batch = Bytes::from(vec![b'x'; 4096]);
+            let mut b = batch.to_vec();
+            b[100..108].copy_from_slice(b"select 1");
+            let batch = Bytes::from(b);
+            query(&mut c, 1, batch.slice(100..108));
+            let s = c.stmts.values().next().unwrap();
+            assert_eq!(&s.sql[..], b"select 1");
+            let range = batch.as_ptr_range();
+            assert!(!range.contains(&s.sql.as_ptr()));
+        }
+
+        #[test]
+        fn a_failed_parse_closes_the_statement_on_the_next_query() {
+            let (mut c, _peer) = conn(&[], State::Ready);
+            query(&mut c, 1, Bytes::from_static(b"selec 1"));
+            let ready = read(&mut c, &[error("42601"), msg(b'Z', b"I")].concat());
+            assert!(!ready.is_empty());
+            assert!(c.stmts.is_empty());
+            assert_eq!(c.closing, ["s1"]);
+            c.out.clear();
+            query(&mut c, 2, Bytes::from_static(b"select 2"));
+            assert!(c.closing.is_empty());
+            // the Close goes first, before the Parse of the new one
+            assert!(closes(&c.out, "s1"));
+            assert_eq!(c.out[0], b'C');
+            // its CloseComplete comes before the answer of query 2
+            let ok = [
+                msg(b'3', b""),
+                msg(b'1', b""),
+                msg(b't', &[0, 0]),
+                msg(b'n', b""),
+                msg(b'2', b""),
+                msg(b'C', b"SELECT 0\0"),
+                msg(b'Z', b"I"),
+            ]
+            .concat();
+            let ready = read(&mut c, &ok);
+            assert_eq!(ready[8], 0); // status 0: rows of query 2
+            assert!(c.waits.is_empty());
+        }
+
+        #[test]
+        fn a_failed_execute_keeps_the_statement() {
+            let (mut c, _peer) = conn(&[], State::Ready);
+            query(&mut c, 1, Bytes::from_static(b"insert 1"));
+            let stream = [
+                msg(b'1', b""),
+                msg(b't', &[0, 0]),
+                msg(b'n', b""),
+                msg(b'2', b""),
+                error("23505"),
+                msg(b'Z', b"I"),
+            ]
+            .concat();
+            read(&mut c, &stream);
+            assert_eq!(c.stmts.len(), 1);
+            assert!(c.closing.is_empty());
+            // the next one uses it, with no Parse
+            c.out.clear();
+            query(&mut c, 2, Bytes::from_static(b"insert 1"));
+            assert_eq!(c.out[0], b'B');
+        }
+
+        #[test]
+        fn an_out_of_date_statement_is_closed() {
+            let (mut c, _peer) = conn(&[], State::Ready);
+            query(&mut c, 1, Bytes::from_static(b"select 1"));
+            let ok = [
+                msg(b'1', b""),
+                msg(b't', &[0, 0]),
+                msg(b'n', b""),
+                msg(b'2', b""),
+                msg(b'C', b"SELECT 0\0"),
+                msg(b'Z', b"I"),
+            ]
+            .concat();
+            read(&mut c, &ok);
+            query(&mut c, 2, Bytes::from_static(b"select 1"));
+            // in a transaction: no retry, the statement is dropped
+            read(&mut c, &[error("0A000"), msg(b'Z', b"E")].concat());
+            assert!(c.stmts.is_empty());
+            assert_eq!(c.closing, ["s1"]);
+        }
     }
 }
