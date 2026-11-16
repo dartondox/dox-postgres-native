@@ -44,7 +44,7 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: native
-      - uses: dart-lang/setup-dart@6afc89df92d6eb3834022f73cd65adc8cdfcb92d # v1.8.1
+      - uses: dart-lang/setup-dart@2286a0c042b44434fe26d292bbce8d34f7ec662b # v1.8.2
         with:
           sdk: stable
       # the build is kept: the Dart build hook uses native/target/release
@@ -154,7 +154,7 @@ jobs:
       # the tag must be on main, so the published code is what main has
       - name: Check that the tag is on main
         run: git merge-base --is-ancestor "$GITHUB_SHA" HEAD && git checkout "$GITHUB_SHA"
-      - uses: dart-lang/setup-dart@6afc89df92d6eb3834022f73cd65adc8cdfcb92d # v1.8.1
+      - uses: dart-lang/setup-dart@2286a0c042b44434fe26d292bbce8d34f7ec662b # v1.8.2
         with:
           sdk: stable
       - name: Fill the hashes
