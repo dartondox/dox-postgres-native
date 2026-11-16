@@ -127,4 +127,118 @@ void main() {
     }
     pool.close();
   });
+
+  group('no prepared statements left on the server after errors', () {
+    PgNativePool open({String? applicationName}) => PgNativePool.open(
+      host: host,
+      port: port,
+      user: 'postgres',
+      password: 'postgres',
+      database: 'postgres',
+      // one connection: all queries see the same server statements
+      maxConnections: 1,
+      applicationName: applicationName,
+    );
+
+    late PgNativePool pool;
+
+    Future<int> prepared({int transaction = 0}) async {
+      PgNativeResult r = await pool.query(
+        'SELECT count(*)::int AS n FROM pg_prepared_statements',
+        transaction: transaction,
+      );
+      return r.rows.first['n'] as int;
+    }
+
+    setUp(() async {
+      pool = open();
+      await pool.query('DROP TABLE IF EXISTS pgn_stmt_leak');
+      await pool.query('CREATE TABLE pgn_stmt_leak (id int PRIMARY KEY)');
+      await pool.query('INSERT INTO pgn_stmt_leak VALUES (1)');
+    });
+
+    tearDown(() async {
+      await pool.query('DROP TABLE IF EXISTS pgn_stmt_leak');
+      pool.close();
+    });
+
+    test('a failed Bind or Execute does not leave one each time', () async {
+      int before = await prepared();
+      for (int i = 0; i < 30; i++) {
+        // all at once: the replies must stay in order
+        List<Object?> got = await Future.wait(<Future<Object?>>[
+          pool
+              .query('INSERT INTO pgn_stmt_leak VALUES (1)')
+              .then<Object?>((_) => 'ok', onError: (Object e) => e),
+          pool
+              .query(r'SELECT $1::int AS n', parameters: <String>['abc'])
+              .then<Object?>((_) => 'ok', onError: (Object e) => e),
+          pool.query('SELECT $i AS n').then<Object?>((PgNativeResult r) => r),
+          pool
+              .query('SELEC $i')
+              .then<Object?>((_) => 'ok', onError: (Object e) => e),
+        ]);
+        expect('${got[0]}', contains('23505'));
+        expect('${got[1]}', contains('22P02'));
+        expect((got[2] as PgNativeResult).rows.first['n'], i);
+        expect('${got[3]}', contains('42601'));
+      }
+      // the failing SELECT stays cached (the INSERT is from setUp), the
+      // 30 selects are cached too; nothing else is left
+      expect(await prepared(), before + 1 + 30);
+      expect((await pool.query('SELECT 7 AS n')).rows.first['n'], 7);
+    });
+
+    test('in a failed transaction too', () async {
+      int before = await prepared();
+      for (int i = 0; i < 10; i++) {
+        int tx = await pool.begin();
+        await expectLater(
+          // not the sql of setUp: a new statement
+          pool.query(
+            'INSERT INTO pgn_stmt_leak (id) VALUES (1)',
+            transaction: tx,
+          ),
+          throwsA(predicate((Object e) => '$e'.contains('23505'))),
+        );
+        // the Parse fails (25P02): the statement does not exist
+        await expectLater(
+          pool.query('SELECT $i', transaction: tx),
+          throwsA(predicate((Object e) => '$e'.contains('25P02'))),
+        );
+        await pool.rollback(tx);
+      }
+      // the INSERT stays cached: one at most
+      expect(await prepared(), lessThanOrEqualTo(before + 1));
+      expect((await pool.query('SELECT 7 AS n')).rows.first['n'], 7);
+    });
+
+    test('an out of date statement is closed, also in a transaction', () async {
+      const String sql = 'SELECT * FROM pgn_stmt_leak';
+      await pool.query(sql);
+      // another pool changes the table: this pool does not see it
+      PgNativePool other = open(applicationName: 'pgn_other');
+      await other.query('ALTER TABLE pgn_stmt_leak ADD COLUMN y int');
+      other.close();
+      int tx = await pool.begin();
+      // 0A000, no retry in a transaction: the statement is dropped
+      await expectLater(
+        pool.query(sql, transaction: tx),
+        throwsA(predicate((Object e) => '$e'.contains('0A000'))),
+      );
+      // the Close goes with this query, in the failed transaction
+      await expectLater(
+        pool.query('SELECT 1', transaction: tx),
+        throwsA(predicate((Object e) => '$e'.contains('25P02'))),
+      );
+      await pool.rollback(tx);
+      PgNativeResult r = await pool.query(
+        'SELECT count(*)::int AS n FROM pg_prepared_statements '
+        'WHERE statement = @s',
+        parameters: <String, Object>{'s': sql},
+      );
+      expect(r.rows.first['n'], 0);
+      expect((await pool.query(sql)).rows.first['y'], isNull);
+    });
+  });
 }

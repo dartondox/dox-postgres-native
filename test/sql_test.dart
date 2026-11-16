@@ -10,6 +10,28 @@ String rewrite(String sql) {
 }
 
 void main() {
+  test('short SQL is cached, long SQL is not', () {
+    expect(
+      identical(ParsedSql.named('SELECT @a'), ParsedSql.named('SELECT @a')),
+      isTrue,
+    );
+    expect(
+      identical(ParsedSql.direct(r'SELECT $1'), ParsedSql.direct(r'SELECT $1')),
+      isTrue,
+    );
+    String values = List<String>.generate(1000, (int i) => '(@a$i)').join(', ');
+    String long = 'INSERT INTO t (x) VALUES $values';
+    expect(long.length, greaterThan(ParsedSql.maxCachedLength));
+    ParsedSql a = ParsedSql.named(long);
+    expect(identical(a, ParsedSql.named(long)), isFalse);
+    expect(
+      a.bind(<String, Object?>{for (int i = 0; i < 1000; i++) 'a$i': i}).length,
+      1000,
+    );
+    expect(String.fromCharCodes(a.sql), endsWith(r'($1000)'));
+    expect(identical(ParsedSql.direct(long), ParsedSql.direct(long)), isFalse);
+  });
+
   test(r'@name becomes $n, the same name the same $n', () {
     expect(rewrite('SELECT @a, @b_2, @a'), r'SELECT $1, $2, $1 | a b_2');
     expect(rewrite('SELECT 1'), 'SELECT 1 | ');
