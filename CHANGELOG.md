@@ -1,4 +1,4 @@
-## Unreleased
+## 3.2.1
 
 - Fix: prepared statements were left on the server after a failed query. When a new query failed after its Parse (eg. a unique violation, a bad value, a statement timeout), the driver forgot its statement but never closed it. Each time this happened, the server kept one more statement until the connection closed (never, by default), so the Postgres backend grew. Now a statement whose Parse worked stays in the cache and is used again. A statement that the driver drops (its Parse failed, or "cached plan must not change result type") gets a Close, sent before the next query on that connection. This works in a failed transaction too.
 - Fix: each cached statement kept the whole request batch from Dart in memory, not only its SQL. Now it keeps its own copy of the SQL.
