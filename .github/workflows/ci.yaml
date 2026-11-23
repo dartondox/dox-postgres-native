@@ -22,6 +22,8 @@ permissions:
 
 env:
   LIB: dox_postgres_native
+  # the oldest glibc that the Linux libraries load on
+  GLIBC: "2.34"
 
 jobs:
   # also on a release tag: a red test stops the build, the release and the publish
@@ -47,14 +49,27 @@ jobs:
       - uses: dart-lang/setup-dart@2286a0c042b44434fe26d292bbce8d34f7ec662b # v1.8.2
         with:
           sdk: stable
-      # the build is kept: the Dart build hook uses native/target/release
+      # zig is the linker of the Linux libraries: it links the unwinder into
+      # the library, so the library does not need libgcc_s, and it sets the
+      # glibc floor
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.16.0
+      - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
+        with:
+          tool: cargo-zigbuild@0.24.1
+      # the build is kept: the Dart build hook uses native/target/release.
+      # It is built as a release builds it, so the Dart tests use the same
+      # type of library that a release ships.
       - name: Rust checks
         working-directory: native
         run: |
           cargo fmt --check
           cargo clippy --release --all-targets -- -D warnings
           cargo test --release
-          cargo build --release
+          cargo zigbuild --release --target "x86_64-unknown-linux-gnu.$GLIBC"
+          cp target/x86_64-unknown-linux-gnu/release/libdox_postgres_native.so target/release/
+          ../tool/check_linux_lib.sh target/release/libdox_postgres_native.so "$GLIBC"
       - name: Dart checks
         run: |
           dart pub get
@@ -76,9 +91,9 @@ jobs:
         include:
           - { os: macos-latest, target: aarch64-apple-darwin, file: libdox_postgres_native.dylib, asset: dox_postgres_native-macos-arm64.dylib }
           - { os: macos-latest, target: x86_64-apple-darwin, file: libdox_postgres_native.dylib, asset: dox_postgres_native-macos-x64.dylib }
-          # 22.04: an older glibc, so the library loads on more Linux systems
-          - { os: ubuntu-22.04, target: x86_64-unknown-linux-gnu, file: libdox_postgres_native.so, asset: dox_postgres_native-linux-x64.so }
-          - { os: ubuntu-22.04-arm, target: aarch64-unknown-linux-gnu, file: libdox_postgres_native.so, asset: dox_postgres_native-linux-arm64.so }
+          # zig: built with `cargo zigbuild` for the glibc floor in `GLIBC`
+          - { os: ubuntu-22.04, target: x86_64-unknown-linux-gnu, file: libdox_postgres_native.so, asset: dox_postgres_native-linux-x64.so, zig: true }
+          - { os: ubuntu-22.04-arm, target: aarch64-unknown-linux-gnu, file: libdox_postgres_native.so, asset: dox_postgres_native-linux-arm64.so, zig: true }
           - { os: windows-latest, target: x86_64-pc-windows-msvc, file: dox_postgres_native.dll, asset: dox_postgres_native-windows-x64.dll }
     runs-on: ${{ matrix.os }}
     steps:
@@ -95,11 +110,27 @@ jobs:
         with:
           toolchain: stable
           targets: ${{ matrix.target }}
+      # zig is the linker of the Linux libraries: it links the unwinder into
+      # the library, so the library does not need libgcc_s, and it sets the
+      # glibc floor
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        if: matrix.zig
+        with:
+          version: 0.16.0
+      - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
+        if: matrix.zig
+        with:
+          tool: cargo-zigbuild@0.24.1
       - name: Build
         shell: bash
         working-directory: native
         run: |
-          cargo build --release --target ${{ matrix.target }}
+          if [ "${{ matrix.zig }}" = "true" ]; then
+            cargo zigbuild --release --target "${{ matrix.target }}.$GLIBC"
+            ../tool/check_linux_lib.sh target/${{ matrix.target }}/release/${{ matrix.file }} "$GLIBC"
+          else
+            cargo build --release --target ${{ matrix.target }}
+          fi
           mkdir -p ../dist
           cp target/${{ matrix.target }}/release/${{ matrix.file }} ../dist/${{ matrix.asset }}
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

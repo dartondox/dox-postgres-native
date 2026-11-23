@@ -1,3 +1,7 @@
+## Unreleased
+
+- The ready-built Linux libraries do not need `libgcc_s.so.1`. They need only glibc 2.34 or newer, as before. A `FROM scratch` Docker image with the Dart `/runtime/` files does not need a copy of `libgcc_s.so.1` for this package. The release build now links the Linux libraries with `cargo zigbuild`, and CI does a check of each library.
+
 ## 3.2.1
 
 - Fix: prepared statements were left on the server after a failed query. When a new query failed after its Parse (eg. a unique violation, a bad value, a statement timeout), the driver forgot its statement but never closed it. Each time this happened, the server kept one more statement until the connection closed (never, by default), so the Postgres backend grew. Now a statement whose Parse worked stays in the cache and is used again. A statement that the driver drops (its Parse failed, or "cached plan must not change result type") gets a Close, sent before the next query on that connection. This works in a failed transaction too.
